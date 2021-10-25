@@ -17,6 +17,7 @@ struct compress_options {
 	uint8_t verify; // 16
 };
 
+
 _Static_assert(20 == sizeof(struct compress_options), "CO size not fit");
 
 struct _UUID {
@@ -43,12 +44,13 @@ struct zfile_ht {
 	struct compress_options opt; // suppose to be 24
 };
 
+
 _Static_assert(96 == sizeof(struct zfile_ht), "Header size not fit");
 
 struct jump_table {
-	uint64_t partial_offset; // 48 bits logical offset + 16 bits partial minimum
-	uint16_t delta;
-};
+	uint64_t partial_offset : 48;  // 48 bits logical offset + 16 bits partial minimum
+	uint16_t delta : 16; 
+} __attribute__((packed));
 
 // zfile can be treated as file with extends
 struct zfile {
@@ -69,7 +71,7 @@ struct zfile *zfile_open(const char *path);
 
 struct zfile *zfile_open_by_file(struct file *file);
 
-bool is_zfile(struct file *file);
+bool is_zfile(struct file *file, struct zfile_ht *ht);
 
 void zfile_close(struct vfile *zfile);
 struct path zfile_getpath(struct zfile *zfile);
