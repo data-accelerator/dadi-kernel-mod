@@ -27,7 +27,7 @@ Or just
 The image file should be LSMT-File on ZFile, image path can be configured by parameter.
 Currently it supports only one-layer image.
 
-`insmod ./vdo.ko backfile=<image file absolute path>`
+`insmod ./vbd.ko backfile=<image file absolute path>`
 
 if succeed, a read-only device called `/dev/vbd0` should appeared, 
 

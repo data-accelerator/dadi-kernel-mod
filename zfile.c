@@ -18,6 +18,32 @@ static uint64_t *MAGIC0 = (uint64_t *)"ZFile\0\1";
 static const uuid_t MAGIC1 = UUID_INIT(0x74756a69, 0x2e79, 0x7966, 0x40, 0x41,
 				       0x6c, 0x69, 0x62, 0x61, 0x62, 0x61);
 
+static const uint32_t FLAG_SHIFT_HEADER = 0; // 1:header     0:trailer
+static const uint32_t FLAG_SHIFT_TYPE = 1; // 1:data file, 0:index file
+static const uint32_t FLAG_SHIFT_SEALED =
+	2; // 1:YES,       0:NO  				# skip it now.
+static const uint32_t FLAG_SHIFT_HEADER_OVERWRITE = 3;
+
+uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
+{
+	return ht->flags & (1 << shift);
+}
+
+bool is_header(struct zfile_ht *ht)
+{
+	return get_flag_bit(ht, FLAG_SHIFT_HEADER);
+}
+
+bool is_header_overwrite(struct zfile_ht *ht)
+{
+	return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
+}
+
+bool is_trailer(struct zfile_ht *ht)
+{
+	return !is_header(ht);
+}
+
 static struct file *file_open(const char *path, int flags, int rights)
 {
 	struct file *fp = NULL;
@@ -211,32 +237,36 @@ struct zfile *zfile_open_by_file(struct file *file)
 	int ret = 0;
 	size_t file_size = 0;
 	loff_t tailer_offset;
-
-	if (!is_zfile(file))
-		return NULL;
-
 	zfile = kzalloc(sizeof(struct zfile), GFP_KERNEL);
+
+	if (!is_zfile(file, &zfile->header)) {
+		return NULL;
+	}
+
 	if (!zfile) {
 		goto error_out;
 	}
-
 	zfile->fp = file;
 
 	// should verify header
-
-	file_size = file_len(zfile->fp);
-	tailer_offset = file_size - ZF_SPACE;
-	pr_info("zfile: file_size=%lu\n", file_size);
-	ret = file_read(zfile->fp, &zfile->header, sizeof(struct zfile_ht),
-			tailer_offset);
-
-	pr_info("zfile: Tailer vsize=%lld index_offset=%lld index_size=%lld "
-		"verify=%d\n",
-		zfile->header.vsize, zfile->header.index_offset,
-		zfile->header.index_size, zfile->header.opt.verify);
-
-	pr_info("zfile: vlen=%lld size=%ld\n", zfile->header.vsize,
-		zfile_len((struct vfile *)zfile));
+	if (!is_header_overwrite(&zfile->header)) {
+		file_size = file_len(zfile->fp);
+		tailer_offset = file_size - ZF_SPACE;
+		pr_info("zfile: file_size=%lu\n", file_size);
+		ret = file_read(zfile->fp, &zfile->header,
+				sizeof(struct zfile_ht), tailer_offset);
+		pr_info("zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+			"verify=%d\n",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	} else {
+		pr_info("zfile header overwrite: size=%lld index_offset=%lld "
+			"index_size=%lld verify=%d\n",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	}
+	// pr_info("zfile: vlen=%lld size=%ld\n", zfile->header.vsize,
+	// 	zfile_len((struct vfile *)zfile));
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	printk("get index_size %lu, index_offset %llu", jt_size,
@@ -285,20 +315,16 @@ struct file *zfile_getfile(struct zfile *zfile)
 	return zfile->fp;
 }
 
-bool is_zfile(struct file *file)
+bool is_zfile(struct file *file, struct zfile_ht *ht)
 {
-	struct zfile_ht ht;
 	ssize_t ret;
-
 	if (!file)
 		return false;
 
-	ret = file_read(file, &ht, sizeof(struct zfile_ht), 0);
-
+	ret = file_read(file, ht, sizeof(struct zfile_ht), 0);
 	if (ret < (ssize_t)sizeof(struct zfile_ht)) {
 		pr_info("zfile: failed to load header %ld \n", ret);
 		return false;
 	}
-
-	return ht.magic0 == *MAGIC0 && uuid_equal(&ht.magic1, &MAGIC1);
+	return ht->magic0 == *MAGIC0 && uuid_equal(&(ht->magic1), &MAGIC1);
 }
