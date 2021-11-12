@@ -28,4 +28,6 @@ struct vfile {
 	struct vfile_op *op;
 };
 
+typedef struct vfile IFile;
+
 #endif

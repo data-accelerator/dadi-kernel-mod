@@ -24,10 +24,9 @@ Or just
 
 ### Use
 
-The image file should be LSMT-File on ZFile, image path can be configured by parameter.
-Currently it supports only one-layer image.
+The image file should be LSMT-File on ZFile(__without Tar file header currently.__), image path can be configured by parameter.
 
-`insmod ./vbd.ko backfile=<image file absolute path>`
+`insmod ./vbd.ko backfile=<absolute path0>,<absolute path1>,<absolute path2>...`
 
 if succeed, a read-only device called `/dev/vbd0` should appeared, 
 
@@ -67,3 +66,17 @@ In table part, the target type is `lsmt_target`, then follows a parameter to ref
 After the mapped-device ready, it could able to mount
 
 `mount /dev/mapper/vbd0 <mount point>`
+
+
+### Test Image
+We upload test image to https://dadi-shared.oss-cn-beijing.aliyuncs.com/kernel-test/obd_testimg.tgz.
+
+Start test with the commands:
+```bash
+wget https://dadi-shared.oss-cn-beijing.aliyuncs.com/kernel-test/obd_testimg.tgz
+tar -zxvf obd_testimg.tgz
+cd obd_testimg/
+cp /path/to/vbd.ko ./
+insmod ./vbd.ko backfile=`pwd`/0,`pwd`/1,`pwd`/2,`pwd`/3,`pwd`/4,`pwd`/5,`pwd`/6
+```
+GOOD LUCK !

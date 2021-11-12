@@ -7,6 +7,8 @@
 
 #include "vfile.h"
 
+#define OVBD_MAX_LAYERS 256
+
 struct zfile;
 
 struct lsmt_ht {
@@ -40,27 +42,28 @@ struct lsmt_ro_index {
 	struct segment_mapping *mapping;
 };
 
-struct lsmt_file {
+struct lsmt_ro_file {
 	struct vfile vfile;
-	struct vfile *fp;
 	bool ownership;
 	int nr;
 	struct lsmt_ht ht;
-	struct lsmt_ro_index index;
+	struct lsmt_ro_index* index;
 	struct bio_set bioset;
+	IFile* fp[0];
 };
 
-// lsmt_file functions...
-// in `lsmt_file`, all data read by using `zfile_read`
-struct lsmt_file *lsmt_open_ro(struct vfile *zf, bool ownership);
+
+// lsmt_ro_file functions...
+// in `lsmt_ro_file`, all data read by using `zfile_read`
+struct lsmt_ro_file *lsmt_open_ro(IFile *zf, bool ownership);
 
 // TODO: load multiple layer index
-// lsmt_file merge
+// lsmt_ro_file merge
 // open multiple files and merge as one lsmt file output
-// struct lsmt_file *lsmt_open_merge(struct vfile *lf, int n);
+struct lsmt_ro_file *lsmt_open_files(IFile *zf[], int n);
 
 // TODO: lsmt_open_rw support
-// struct lsmt_file* lsmt_open_rw(struct zfile* zf, int n, struct file* wfile);
+// struct lsmt_ro_file* lsmt_open_rw(struct zfile* zf, int n, struct file* wfile);
 bool is_lsmtfile(struct vfile *zf);
 
 #endif

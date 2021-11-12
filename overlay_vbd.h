@@ -9,7 +9,9 @@
 #include <linux/kthread.h>
 #include <linux/blk-mq.h>
 
-struct lsmt_file;
+struct lsmt_ro_file;
+struct vfile;
+typedef struct vfile IFile;
 /*
  * Each block ovbd device has a radix_tree ovbd_pages of pages that stores
  * the pages containing the block device's contents. A ovbd page's ->index is
@@ -36,7 +38,7 @@ struct ovbd_device {
 	// block-dev provides data by
 	// using `lsmtfile_read`
 	// assume block-dev size is `lsmtfile_len`
-	struct vfile *fp;
+	IFile *fp;
 	unsigned char *path;
 
 	struct kthread_worker worker;

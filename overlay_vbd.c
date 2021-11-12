@@ -23,14 +23,18 @@
 #include <linux/radix-tree.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/string.h>
 
 #include "lsmt.h"
 #include "zfile.h"
 #include "overlay_vbd.h"
+#include "log-format.h"
 
 #define PAGE_SECTORS_SHIFT (PAGE_SHIFT - SECTOR_SHIFT)
-#define OVBD_MAJOR 231
+#define OVBD_MAJOR 232
 #define OVBD_CACHE_SIZE 536870912000
+
+#define MODULE_NAME "ovbd"
 
 static const struct block_device_operations ovbd_fops = {
 	.owner = THIS_MODULE,
@@ -260,13 +264,26 @@ static struct ovbd_device *ovbd_alloc(int i)
 	disk->private_data = ovbd;
 	disk->flags = GENHD_FL_EXT_DEVT | GENHD_FL_NO_PART_SCAN;
 	sprintf(disk->disk_name, "vbd%d", i);
-	pr_info("vbd: disk->disk_name %s\n", disk->disk_name);
-	ovbd->fp = (struct vfile *)lsmt_open_ro(
-		(struct vfile *)zfile_open(backfile), true);
+	PRINT_INFO("vbd: disk->disk_name %s", disk->disk_name);
+	IFile *files[OVBD_MAX_LAYERS];
+	char *path = strsep(&backfile, ",");
+	int n = 0;
+	while (path != NULL) {
+		IFile *file = (IFile *)zfile_open(path);
+		if (file == NULL) {
+			PRINT_ERROR("open file failed: %s", path);
+			goto out_free_queue;
+		}
+		files[n++] = file;
+		path = strsep(&backfile, ",");
+	}
+
+	ovbd->fp = (IFile *)lsmt_open_files(files, n);
 	if (!ovbd->fp) {
-		pr_info("Cannot load lsmtfile\n");
+		PRINT_ERROR("Cannot load lsmt merged file.");
 		goto out_free_queue;
 	}
+	PRINT_INFO("overlaybd merged view: %x", ovbd->fp);
 	err = ovbd_prepare_queue(ovbd, i);
 	if (err)
 		goto out_free_queue;
@@ -318,7 +335,7 @@ static struct ovbd_device *ovbd_init_one(int i, bool *new)
 	ovbd = ovbd_alloc(i);
 	if (ovbd) {
 		ovbd->ovbd_disk->queue = ovbd->ovbd_queue;
-		pr_info("add_disk\n");
+		PRINT_INFO("add_disk\n");
 		add_disk(ovbd->ovbd_disk);
 		list_add_tail(&ovbd->ovbd_list, &ovbd_devices);
 	}
@@ -342,7 +359,7 @@ static struct kobject *ovbd_probe(dev_t dev, int *part, void *data)
 	bool new;
 
 	mutex_lock(&ovbd_devices_mutex);
-	printk("ovbd_probe");
+	PRINT_INFO("ovbd_probe");
 	ovbd = ovbd_init_one(MINOR(dev), &new);
 	kobj = ovbd ? get_disk_and_module(ovbd->ovbd_disk) : NULL;
 	mutex_unlock(&ovbd_devices_mutex);
@@ -358,13 +375,13 @@ static int __init ovbd_init(void)
 	struct ovbd_device *ovbd, *next;
 	int i;
 
-	pr_info("vbd: INIT\n");
+	PRINT_INFO("vbd: INIT");
 
-	if (register_blkdev(OVBD_MAJOR, "ovbd"))
+	if (register_blkdev(OVBD_MAJOR, MODULE_NAME))
 		return -EIO;
 
 	// 先打开文件再创建设备
-	pr_info("alloc");
+	PRINT_INFO("alloc");
 	for (i = 0; i < 1; i++) {
 		ovbd = ovbd_alloc(i);
 		if (!ovbd)
@@ -379,16 +396,16 @@ static int __init ovbd_init(void)
          * associate with queue just before adding disk for
          * avoiding to mess up failure path
          */
-		pr_info("vbd: get filesize %d\n", ovbd->block_size);
+		PRINT_INFO("vbd: get filesize %d", ovbd->block_size);
 		ovbd->ovbd_disk->queue = ovbd->ovbd_queue;
-		pr_info("add_disk\n");
+		PRINT_INFO("add_disk");
 		add_disk(ovbd->ovbd_disk);
 	}
-	pr_info("Register blk\n");
+	PRINT_INFO("Register block, major_id: %d", OVBD_MAJOR);
 	blk_register_region(MKDEV(OVBD_MAJOR, 0), 1UL << MINORBITS, THIS_MODULE,
 			    ovbd_probe, NULL, NULL);
 
-	pr_info("ovbd: module loaded\n");
+	PRINT_INFO("module loaded");
 
 	return 0;
 
@@ -397,8 +414,8 @@ out_free:
 		list_del(&ovbd->ovbd_list);
 		ovbd_free(ovbd);
 	}
-	unregister_blkdev(OVBD_MAJOR, "ovbd");
-	pr_info("ovbd: module NOT loaded !!!\n");
+	unregister_blkdev(OVBD_MAJOR, MODULE_NAME);
+	PRINT_ERROR("ovbd: module NOT loaded !!!");
 	return -ENOMEM;
 }
 
@@ -411,9 +428,9 @@ static void __exit ovbd_exit(void)
 	}
 
 	blk_unregister_region(MKDEV(OVBD_MAJOR, 0), 1UL << MINORBITS);
-	unregister_blkdev(OVBD_MAJOR, "ovbd");
+	unregister_blkdev(OVBD_MAJOR, MODULE_NAME);
 
-	pr_info("ovbd: module unloaded\n");
+	PRINT_INFO("ovbd: module unloaded");
 }
 
 module_init(ovbd_init);
