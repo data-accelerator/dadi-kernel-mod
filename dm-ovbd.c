@@ -15,7 +15,7 @@
  */
 struct lsmt_dm_target {
 	struct dm_dev *dev[256];
-	struct lsmt_file *lsmt;
+	struct lsmt_ro_file *lsmt;
 	struct vfile *bf[256];
 	unsigned int nr;
 };

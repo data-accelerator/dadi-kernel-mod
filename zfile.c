@@ -12,6 +12,8 @@
 #include <linux/uaccess.h>
 #include <linux/uio.h>
 #include <linux/vmalloc.h>
+#include "log-format.h"
+
 
 static const uint32_t ZF_SPACE = 512;
 static uint64_t *MAGIC0 = (uint64_t *)"ZFile\0\1";
@@ -49,11 +51,11 @@ static struct file *file_open(const char *path, int flags, int rights)
 	struct file *fp = NULL;
 	fp = filp_open(path, O_RDONLY, 0);
 	if (IS_ERR(fp)) {
-		printk("Cannot open the file %ld\n", PTR_ERR(fp));
+		PRINT_ERROR("Cannot open the file %ld", PTR_ERR(fp));
 		return NULL;
 	}
 	vfs_fadvise(fp, 0, fp->f_inode->i_size, POSIX_FADV_RANDOM);
-	printk("Opened the file %s", path);
+	PRINT_INFO("Opened the file %s", path);
 	return fp;
 }
 
@@ -81,7 +83,7 @@ static ssize_t file_read(struct file *file, void *buf, size_t count, loff_t pos)
 		lpos = pos;
 		ret = kernel_read(file, buf, count, &lpos);
 		if (lpos <= pos || ret <= 0) {
-			pr_info("zfile: read underlay file at %lld, pos move to %lld, return "
+			PRINT_INFO("zfile: read underlay file at %lld, pos move to %lld, return "
 				"%ld\n",
 				pos, lpos, ret);
 			return ret;
@@ -121,16 +123,16 @@ ssize_t zfile_read(struct vfile *ctx, void *dst, size_t count, loff_t offset)
 	size_t pcnt;
 
 	if (!zf) {
-		pr_info("zfile: failed empty zf\n");
+		PRINT_INFO("zfile: failed empty zf\n");
 		return -EIO;
-	}
+	}	
 	bs = zf->header.opt.block_size;
 	// read empty
 	if (count == 0)
 		return 0;
 	// read from over-tail
 	if (offset > zf->header.vsize) {
-		pr_info("zfile: read over tail %lld > %lld\n", offset,
+		PRINT_INFO("zfile: read over tail %lld > %lld\n", offset,
 			zf->header.vsize);
 		return 0;
 	}
@@ -151,7 +153,7 @@ ssize_t zfile_read(struct vfile *ctx, void *dst, size_t count, loff_t offset)
 	// read compressed data
 	ret = file_read(zf->fp, src_buf, range, begin);
 	if (ret != range) {
-		pr_info("zfile: Read file failed, %ld != %lld\n", ret, range);
+		PRINT_ERROR("zfile: Read file failed, %ld != %lld", ret, range);
 		ret = -EIO;
 		goto fail_read;
 	}
@@ -168,7 +170,7 @@ ssize_t zfile_read(struct vfile *ctx, void *dst, size_t count, loff_t offset)
 				(zf->header.opt.verify ? sizeof(uint32_t) : 0),
 			bs);
 		if (dc <= 0) {
-			pr_info("decompress failed\n");
+			PRINT_ERROR("decompress failed");
 			ret = -EIO;
 			goto fail_read;
 		}
@@ -210,7 +212,7 @@ void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 void zfile_close(struct vfile *f)
 {
 	struct zfile *zfile = (struct zfile *)f;
-	pr_info("zfile: close\n");
+	PRINT_INFO("close(%lx)", f);
 	if (zfile) {
 		if (zfile->jump) {
 			vfree(zfile->jump);
@@ -252,24 +254,24 @@ struct zfile *zfile_open_by_file(struct file *file)
 	if (!is_header_overwrite(&zfile->header)) {
 		file_size = file_len(zfile->fp);
 		tailer_offset = file_size - ZF_SPACE;
-		pr_info("zfile: file_size=%lu\n", file_size);
+		PRINT_INFO("zfile: file_size=%lu", file_size);
 		ret = file_read(zfile->fp, &zfile->header,
 				sizeof(struct zfile_ht), tailer_offset);
-		pr_info("zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-			"verify=%d\n",
+		PRINT_INFO("zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+			"verify=%d",
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
 	} else {
-		pr_info("zfile header overwrite: size=%lld index_offset=%lld "
-			"index_size=%lld verify=%d\n",
+		PRINT_INFO("zfile header overwrite: size=%lld index_offset=%lld "
+			"index_size=%lld verify=%d",
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
 	}
-	// pr_info("zfile: vlen=%lld size=%ld\n", zfile->header.vsize,
+	// PRINT_INFO("zfile: vlen=%lld size=%ld\n", zfile->header.vsize,
 	// 	zfile_len((struct vfile *)zfile));
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
-	printk("get index_size %lu, index_offset %llu", jt_size,
+	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
 	       zfile->header.index_offset);
 
 	if (jt_size == 0 || jt_size > 1024UL * 1024 * 1024) {
@@ -300,7 +302,7 @@ struct zfile *zfile_open(const char *path)
 	struct zfile *ret = NULL;
 	struct file *file = file_open(path, 0, 644);
 	if (!file) {
-		pr_info("zfile: Canot open zfile %s\n", path);
+		PRINT_ERROR("zfile: Canot open zfile %s", path);
 		return NULL;
 	}
 	ret = zfile_open_by_file(file);
@@ -323,7 +325,7 @@ bool is_zfile(struct file *file, struct zfile_ht *ht)
 
 	ret = file_read(file, ht, sizeof(struct zfile_ht), 0);
 	if (ret < (ssize_t)sizeof(struct zfile_ht)) {
-		pr_info("zfile: failed to load header %ld \n", ret);
+		PRINT_INFO("zfile: failed to load header %ld", ret);
 		return false;
 	}
 	return ht->magic0 == *MAGIC0 && uuid_equal(&(ht->magic1), &MAGIC1);

@@ -5,6 +5,8 @@ obj-m += vbd.o
 
 MODE_LOOP=y
 
+ccflags-y := -std=gnu11 -Wno-declaration-after-statement
+
 vbd-$(CONFIG_DADI_LOOP) := overlay_vbd.o lsmt.o zfile.o
 vbd-$(CONFIG_DADI_DM) := dm-ovbd.o lsmt.o
 
