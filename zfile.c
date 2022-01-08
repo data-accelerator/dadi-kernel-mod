@@ -200,24 +200,28 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	if (single_page) {
 		// data in same page
 		spage = xa_load(pool, pbegin);
-		lock_page(spage);
+		if (!PageUptodate(spage)) {
+			lock_page(spage);
+			unlock_page(spage);
+		}
 		holder = kmap_atomic(spage);
 		src = holder + begin % PAGE_SIZE;
 	} else {
 		src = tmp = kmalloc(PAGE_SIZE << 1, GFP_KERNEL);
-
 		for (i = begin & PAGE_MASK; i < end; i += PAGE_SIZE) {
 			segment_left = i > begin ? i : begin;
 			segment_right =
 				i + PAGE_SIZE < end ? i + PAGE_SIZE : end;
 			spage = xa_load(pool, i >> PAGE_SHIFT);
-			lock_page(spage);
+			if (!PageUptodate(spage)) {
+				lock_page(spage);
+				unlock_page(spage);
+			}
 			holder = kmap_atomic(spage);
 			memcpy(tmp, holder + segment_left - i,
 			       segment_right - segment_left);
 			tmp += segment_right - segment_left;
 			kunmap_atomic(holder);
-			unlock_page(spage);
 		}
 	}
 
@@ -225,7 +229,6 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 
 	if (single_page) {
 		kunmap_atomic(holder);
-		unlock_page(spage);
 	} else {
 		kfree(src);
 	}
@@ -261,7 +264,7 @@ struct decompress_work {
 	struct bio *bio;
 };
 
-void do_decompress(struct zfile *zf, struct bio *bio)
+static void do_decompress(struct zfile *zf, struct bio *bio)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
@@ -279,7 +282,7 @@ void do_decompress(struct zfile *zf, struct bio *bio)
 	bio_endio(bio);
 }
 
-void decompress_fn(struct kthread_work *work)
+static void decompress_fn(struct kthread_work *work)
 {
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
@@ -287,8 +290,8 @@ void decompress_fn(struct kthread_work *work)
 	kfree(cmd);
 }
 
-int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
-		   unsigned int nr)
+static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
+			  unsigned int nr)
 {
 	struct zfile *zf = (struct zfile *)ctx;
 	loff_t offset = bio->bi_iter.bi_sector;
