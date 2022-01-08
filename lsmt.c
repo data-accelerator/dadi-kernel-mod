@@ -33,15 +33,12 @@
 #define TYPE_FILDES 2
 #define TYPE_LSMT_RO_INDEX 3
 
-static const size_t INFILE_BIO_POOL_SIZE = 256;
 static const uint64_t INVALID_OFFSET = (1UL << 50) - 1;
 static const uint32_t HT_SPACE = 4096;
 static const uint32_t ALIGNMENT4K = 4 << 10;
 static uint64_t *MAGIC0 = (uint64_t *)"LSMT\0\1\2";
 static const uuid_t MAGIC1 = UUID_INIT(0x657e63d2, 0x9444, 0x084c, 0xa2, 0xd2,
 				       0xc8, 0xec, 0x4f, 0xcf, 0xae, 0x8a);
-
-static struct segment_mapping INVALID_MAPPING = { INVALID_OFFSET, 0, 0, 0, 0 };
 
 size_t lsmt_len(IFile *fp);
 ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset);
@@ -208,11 +205,14 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 	size_t i = 0;
 	loff_t offset = bio->bi_iter.bi_sector;
 	if (bio_op(bio) != REQ_OP_READ) {
+		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 
 	if ((offset << SECTOR_SHIFT) > fp->ht.virtual_size) {
-		PRINT_INFO("LSMT: %lld over tail\n", offset);
+		PRINT_INFO("LSMT: %lld over tail %lld\n", offset,
+			   fp->ht.virtual_size);
+		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 
@@ -223,15 +223,17 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 
 	s.offset = bio->bi_iter.bi_sector;
 	s.length = bio_sectors(bio);
+	bio->bi_status = BLK_STS_OK;
+	// pr_info("lsmt remap: s.offset=%lu s.length=%u\n", 0UL+s.offset, s.length);
 	while (true) {
-		int n = ro_index_lookup(fp->index, &s, m, 16);
+		int n = ro_index_lookup(fp->index, &s, m, 1);
 		for (i = 0; i < n; ++i) {
 			if (s.offset < m[i].offset) {
 				// hole
-				if (m[i].length < s.length) {
+				if (m[i].length < bio_sectors(bio)) {
 					subbio = bio_split(
 						bio, m[i].offset - s.offset,
-						GFP_NOIO, &fp->bioset);
+						GFP_KERNEL, NULL);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
 				} else {
@@ -242,10 +244,9 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 			}
 			// zeroe block
 			if (m[i].zeroed) {
-				if (m[i].length < s.length) {
+				if (m[i].length < bio_sectors(bio)) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO,
-							   &fp->bioset);
+							   GFP_KERNEL, NULL);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
 				} else {
@@ -255,12 +256,12 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 				}
 			} else {
 				bio_set_dev(bio, dev[m[i].tag]->bdev);
-				if (m[i].length < s.length) {
+				if (m[i].length < bio_sectors(bio)) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO,
-							   &fp->bioset);
+							   GFP_KERNEL, NULL);
 					subbio->bi_iter.bi_sector =
 						m[i].moffset;
+					bio_chain(subbio, bio);
 					submit_bio(subbio);
 				} else {
 					bio->bi_iter.bi_sector = m[i].moffset;
@@ -305,7 +306,7 @@ ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset)
 		PRINT_INFO("LSMT: %lld %lu over tail\n", offset, count);
 		count = lsmt_file->ht.virtual_size - offset;
 	}
-	m = kmalloc(16 * sizeof(struct segment_mapping), GFP_NOIO);
+	m = kmalloc(16 * sizeof(struct segment_mapping), GFP_KERNEL);
 	s.offset = offset / SECTOR_SIZE;
 	s.length = count / SECTOR_SIZE;
 	while (true) {
@@ -330,8 +331,8 @@ ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset)
 				int layer_id = m[i].tag;
 				ssize_t dc = lsmt_file->fp[layer_id]->op->pread(
 					lsmt_file->fp[layer_id], buf,
-					m->length * SECTOR_SIZE,
-					m->moffset * SECTOR_SIZE);
+					m[i].length * SECTOR_SIZE,
+					m[i].moffset * SECTOR_SIZE);
 				if (dc <= 0) {
 					PRINT_INFO(
 						"LSMT: read failed ret=%ld\n",
@@ -366,7 +367,7 @@ bool is_lsmtfile(IFile *fp)
 	if (!fp)
 		return false;
 
-	PRINT_INFO("LSMT: read header(IFile: %x)", fp);
+	PRINT_INFO("LSMT: read header(IFile: %p)", fp);
 	ret = fp->op->pread(fp, &ht, sizeof(struct lsmt_ht), 0);
 
 	if (ret < (ssize_t)sizeof(struct lsmt_ht)) {
@@ -386,7 +387,6 @@ void lsmt_close(IFile *ctx)
 		}
 	}
 	vfree(lsmt_file->index->mapping);
-	bioset_exit(&lsmt_file->bioset);
 	kfree(lsmt_file);
 }
 
@@ -458,14 +458,14 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 {
 	size_t size = 0;
 	size_t capacity = ro_index_size(indexes[0]);
-	PRINT_DEBUG("init capacity: %ld\n", capacity);
+	PRINT_DEBUG("init capacity: %lu\n", capacity);
 	struct lsmt_ro_index *ret = NULL;
 	struct segment_mapping *mappings = (struct segment_mapping *)kmalloc(
 		sizeof(struct segment_mapping) * capacity, GFP_KERNEL);
 	if (!mappings) {
 		goto err_ret;
 	}
-	PRINT_DEBUG("start merge indexes, layers: %d", n);
+	PRINT_DEBUG("start merge indexes, layers: %lu", n);
 	merge_indexes(0, indexes, n, &mappings, &size, &capacity, 0,
 		      UINT64_MAX);
 	PRINT_INFO("merge done, index size: %lu", size);
@@ -493,7 +493,7 @@ static ssize_t do_load_index(IFile *fp, struct segment_mapping *p,
 			     struct lsmt_ht *ht)
 {
 	ssize_t index_bytes = ht->index_size * sizeof(struct segment_mapping);
-	PRINT_INFO("LSMT: loadindex off: %lld cnt: %ld", ht->index_offset,
+	PRINT_INFO("LSMT: loadindex off: %llu cnt: %llu", ht->index_offset,
 		   ht->index_size);
 	ssize_t readn = fp->op->pread(fp, p, index_bytes, ht->index_offset);
 	if (readn < index_bytes) {
@@ -505,14 +505,14 @@ static ssize_t do_load_index(IFile *fp, struct segment_mapping *p,
 		if (p[idx].offset != INVALID_OFFSET) {
 			p[valid] = p[idx];
 			p[valid].tag = 0;
-			PRINT_DEBUG("valid index %d {offset: %lu, length: %lu}",
-				    valid, p[idx].offset, p[idx].length);
+			PRINT_DEBUG("valid index %lu {offset: %lu, length: %u}",
+				    valid, p[idx].offset + 0UL, p[idx].length);
 			valid++;
 		}
 	}
 	PRINT_INFO("valid index count: %ld", valid);
 	ht->index_size = valid;
-	return 0;
+	return valid;
 }
 
 static ssize_t lsmt_load_ht(IFile *fp, struct lsmt_ht *ht)
@@ -521,17 +521,18 @@ static ssize_t lsmt_load_ht(IFile *fp, struct lsmt_ht *ht)
 	loff_t tailer_offset;
 	ssize_t ret;
 	if (!is_lsmtfile(fp)) {
-		PRINT_INFO("LSMT: fp is not a lsmtfile(%x)\n", fp);
+		PRINT_INFO("LSMT: fp is not a lsmtfile(%p)\n", fp);
 		return -1;
 	}
 	file_size = fp->op->len(fp);
+	PRINT_INFO("LSMT: file len is %ld\n", file_size);
 	tailer_offset = file_size - HT_SPACE;
 	ret = fp->op->pread(fp, ht, sizeof(struct lsmt_ht), tailer_offset);
 	if (ret < (ssize_t)sizeof(struct lsmt_ht)) {
-		PRINT_ERROR("failed to load tailer(%x)\n", fp);
+		PRINT_ERROR("failed to load tailer(%p)\n", fp);
 		return -1;
 	}
-	PRINT_INFO("LSMT(%x), index_offset %lu: index_count: %lu", fp,
+	PRINT_INFO("LSMT(%p), index_offset %llu: index_count: %llu", fp,
 		   ht->index_offset, ht->index_size);
 
 	return 0;
@@ -540,27 +541,27 @@ static ssize_t lsmt_load_ht(IFile *fp, struct lsmt_ht *ht)
 static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 					      struct lsmt_ht *ht)
 {
-	struct lsmt_ro_index *indexes[OVBD_MAX_LAYERS];
+	struct lsmt_ro_index *(*indexes) = kzalloc(
+		sizeof(struct lsmt_ro_index *) * OVBD_MAX_LAYERS, GFP_KERNEL);
 	struct lsmt_ro_index *pmi = NULL;
 	if (n > OVBD_MAX_LAYERS) {
 		PRINT_ERROR("too many indexes to merge, %d at most!",
 			    OVBD_MAX_LAYERS);
-		return NULL;
+		goto error_ret;
 	}
 	for (int i = 0; i < n; ++i) {
 		PRINT_INFO("read %d-th LSMT info", i);
-		ssize_t size = 0;
 		// struct lsmt_ht ht;
-		ssize_t ok = lsmt_load_ht(files[i], ht);
+		lsmt_load_ht(files[i], ht);
 		size_t index_bytes =
 			ht->index_size * sizeof(struct segment_mapping);
 		if (index_bytes == 0 || index_bytes > 1024UL * 1024 * 1024)
-			return NULL;
+			goto error_ret;
 		struct segment_mapping *p = vmalloc(index_bytes);
 		if (do_load_index(files[i], p, ht) == -1) {
 			vfree(p);
 			PRINT_ERROR("failed to load index from %d-th file", i);
-			return NULL;
+			goto error_ret;
 		}
 		struct lsmt_ro_index *pi = create_memory_index(
 			p, ht->index_size, HT_SPACE / ALIGNMENT,
@@ -570,7 +571,7 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 				"failed to create memory index! ( %d-th file )",
 				i);
 			vfree(p);
-			return NULL;
+			goto error_ret;
 		}
 		indexes[i] = pi;
 	}
@@ -585,69 +586,15 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 		goto error_ret;
 	}
 	PRINT_DEBUG("merge index done.");
-
+	kfree(indexes);
 	return pmi;
 
 error_ret:
+	kfree(indexes);
 	return NULL;
 }
 
-struct lsmt_ro_file *lsmt_open_ro(IFile *fp, bool ownership)
-{
-	ssize_t cnt = 0;
-	ssize_t index_bytes;
-
-	if (!fp) {
-		PRINT_INFO("LSMT: failed to open zfile(%x)\n", fp);
-		return NULL;
-	}
-	size_t size = sizeof(struct lsmt_ro_file) + 2 * sizeof(IFile *);
-	struct lsmt_ro_file *lf =
-		(struct lsmt_ro_file *)kzalloc(size, GFP_KERNEL);
-	if (!lf)
-		goto error_out;
-	lf->fp[0] = NULL;
-	lf->fp[1] = fp;
-	lf->ownership = ownership;
-
-	cnt = lsmt_load_ht(fp, &lf->ht);
-	if (cnt < 0) {
-		goto error_out;
-	}
-
-	index_bytes = lf->ht.index_size * sizeof(struct segment_mapping);
-	PRINT_INFO("LSMT: off: %lld, bytes: %ld", lf->ht.index_offset,
-		   index_bytes);
-	if (index_bytes == 0 || index_bytes > 1024UL * 1024 * 1024)
-		return NULL;
-	struct segment_mapping *p = vmalloc(index_bytes);
-	cnt = do_load_index(fp, p, &lf->ht);
-	if (cnt < 0) {
-		goto error_out;
-	}
-	for (struct segment_mapping *it = &p[0]; it != p + lf->ht.index_size;
-	     it++) {
-		it->tag++;
-	}
-	lf->ht.index_size = cnt;
-	lf->index =
-		create_memory_index(p, lf->ht.index_size, HT_SPACE / ALIGNMENT,
-				    lf->ht.index_offset / ALIGNMENT, false);
-	PRINT_INFO("LSMT: index_size=%lu", cnt);
-	lf->vfile.op = &lsmt_ops;
-	bioset_init(&lf->bioset, INFILE_BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
-	return lf;
-
-error_out:
-	vfree(p);
-	kfree(lf);
-	if (ownership)
-		fp->op->close(fp);
-	return NULL;
-}
-
-// TODO: load multiple layer index
-struct lsmt_ro_file *lsmt_open_files(IFile *zfiles[], int n)
+IFile *lsmt_open_files(IFile *zfiles[], int n)
 {
 	PRINT_INFO("LSMT open_files, layers: %d", n);
 	struct lsmt_ro_file *ret = (struct lsmt_ro_file *)kmalloc(
@@ -664,7 +611,7 @@ struct lsmt_ro_file *lsmt_open_files(IFile *zfiles[], int n)
 	ret->ownership = true;
 	ret->vfile.op = &lsmt_ops;
 	ret->ht.virtual_size = ht.virtual_size;
-	PRINT_DEBUG("ret->fp[0]: %x", &(ret->fp[0]));
+	PRINT_DEBUG("ret->fp[0]: %p", &(ret->fp[0]));
 	memcpy(&(ret->fp[0]), &zfiles[0], n * sizeof(IFile *));
-	return ret;
+	return (IFile *)ret;
 }

@@ -4,6 +4,7 @@
 #include <linux/blk-mq.h>
 #include <linux/kthread.h>
 #include <linux/uuid.h>
+#include <linux/xarray.h>
 
 #include "vfile.h"
 
@@ -54,11 +55,14 @@ struct jump_table {
 
 // zfile can be treated as file with extends
 struct zfile {
-	struct vfile vfile;
-	struct file *fp;
+	IFile vfile;
+	IFile *fp;
 	bool onwership;
 	struct zfile_ht header;
 	struct jump_table *jump;
+	struct xarray cpages;
+	struct kthread_worker worker;
+	struct task_struct *worker_task;
 };
 
 // zfile functions
@@ -67,15 +71,12 @@ struct zfile {
 // more-than-one page fetch, here is the place to caching non-complete used
 // compressed pages.
 //
-struct zfile *zfile_open(const char *path);
+IFile *zfile_open(const char *path);
 
-struct zfile *zfile_open_by_file(struct file *file);
+IFile *zfile_open_by_file(struct vfile *file);
 
-bool is_zfile(struct file *file, struct zfile_ht *ht);
+bool is_zfile(struct vfile *file, struct zfile_ht *ht);
 
 void zfile_close(struct vfile *zfile);
-struct path zfile_getpath(struct zfile *zfile);
-
-struct file *zfile_getfile(struct zfile *zfile);
 
 #endif

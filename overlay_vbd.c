@@ -265,7 +265,7 @@ static struct ovbd_device *ovbd_alloc(int i)
 	disk->flags = GENHD_FL_EXT_DEVT | GENHD_FL_NO_PART_SCAN;
 	sprintf(disk->disk_name, "vbd%d", i);
 	PRINT_INFO("vbd: disk->disk_name %s", disk->disk_name);
-	IFile *files[OVBD_MAX_LAYERS];
+	IFile **files = kzalloc(sizeof(IFile*) * OVBD_MAX_LAYERS, GFP_KERNEL);
 	char *path = strsep(&backfile, ",");
 	int n = 0;
 	while (path != NULL) {
@@ -283,7 +283,7 @@ static struct ovbd_device *ovbd_alloc(int i)
 		PRINT_ERROR("Cannot load lsmt merged file.");
 		goto out_free_queue;
 	}
-	PRINT_INFO("overlaybd merged view: %x", ovbd->fp);
+	PRINT_INFO("overlaybd merged view: %p", (void*)ovbd->fp);
 	err = ovbd_prepare_queue(ovbd, i);
 	if (err)
 		goto out_free_queue;
@@ -310,6 +310,7 @@ out_cleanup_tags:
 out_free_dev:
 	kfree(ovbd);
 out:
+	kzfree(files);
 	return NULL;
 }
 

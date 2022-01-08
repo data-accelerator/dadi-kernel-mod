@@ -43,24 +43,22 @@ struct lsmt_ro_index {
 };
 
 struct lsmt_ro_file {
-	struct vfile vfile;
+	IFile vfile;
 	bool ownership;
 	int nr;
 	struct lsmt_ht ht;
-	struct lsmt_ro_index* index;
-	struct bio_set bioset;
-	IFile* fp[0];
+	struct lsmt_ro_index *index;
+	IFile *fp[0];
 };
 
-
-// lsmt_ro_file functions...
-// in `lsmt_ro_file`, all data read by using `zfile_read`
-struct lsmt_ro_file *lsmt_open_ro(IFile *zf, bool ownership);
+// // lsmt_ro_file functions...
+// // in `lsmt_ro_file`, all data read by using `zfile_read`
+// IFile *lsmt_open_ro(IFile *zf, bool ownership);
 
 // TODO: load multiple layer index
 // lsmt_ro_file merge
 // open multiple files and merge as one lsmt file output
-struct lsmt_ro_file *lsmt_open_files(IFile *zf[], int n);
+IFile *lsmt_open_files(IFile *zf[], int n);
 
 // TODO: lsmt_open_rw support
 // struct lsmt_ro_file* lsmt_open_rw(struct zfile* zf, int n, struct file* wfile);
