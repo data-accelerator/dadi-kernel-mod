@@ -33,16 +33,15 @@ static ssize_t sync_read_blkdev(struct block_device *dev, void *buf,
 
 	for (i = left; i < right; i += PAGE_SIZE) {
 		pg = alloc_page(GFP_NOIO);
-		if (!bio_add_page(bio, pg,
-				  right - i > PAGE_SIZE ? PAGE_SIZE : right - i,
-				  0))
-			BUG();
+		BUG_ON(!bio_add_page(
+			bio, pg, right - i > PAGE_SIZE ? PAGE_SIZE : right - i,
+			0));
 		pages[(i - left) / PAGE_SIZE] = pg;
 	}
 	bio_set_dev(bio, dev);
 	bio->bi_iter.bi_sector = left >> SECTOR_SHIFT;
 	bio_set_op_attrs(bio, REQ_OP_READ, 0);
-	
+
 	submit_bio_wait(bio);
 
 	if (bio->bi_status != BLK_STS_OK) {

@@ -6,6 +6,7 @@
 #include <linux/lz4.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
@@ -179,15 +180,14 @@ void zfile_close(struct vfile *f)
 static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 {
 	void *dst = NULL;
-	void *src, *tmp, *holder;
+	void *src, *holder;
 	size_t idx, c_cnt;
-	loff_t begin, end, pbegin, pend, i, segment_left, segment_right;
+	loff_t begin, end, pbegin, pend, i, k;
 	struct xarray *pool = &zf->cpages;
-	struct page *spage;
+	struct page *spage[3];
 	bool single_page;
 	int ret = 0;
 
-	// pr_debug("zf_decompress %p %lld\n", page, offset);
 	dst = kmap_atomic(page);
 	idx = offset >> PAGE_SHIFT;
 	begin = zf->jump[idx].partial_offset;
@@ -197,32 +197,27 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	pbegin = begin >> PAGE_SHIFT;
 	pend = (end + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	single_page = ((pend - pbegin) == 1);
+	BUG_ON(pend - pbegin > 3);
 	if (single_page) {
 		// data in same page
-		spage = xa_load(pool, pbegin);
-		if (!PageUptodate(spage)) {
-			lock_page(spage);
-			unlock_page(spage);
+		spage[0] = xa_load(pool, pbegin);
+		if (!PageUptodate(spage[0])) {
+			lock_page(spage[0]);
+			unlock_page(spage[0]);
 		}
-		holder = kmap_atomic(spage);
+		holder = kmap_atomic(spage[0]);
 		src = holder + begin % PAGE_SIZE;
 	} else {
-		src = tmp = kmalloc(PAGE_SIZE << 1, GFP_KERNEL);
 		for (i = begin & PAGE_MASK; i < end; i += PAGE_SIZE) {
-			segment_left = i > begin ? i : begin;
-			segment_right =
-				i + PAGE_SIZE < end ? i + PAGE_SIZE : end;
-			spage = xa_load(pool, i >> PAGE_SHIFT);
-			if (!PageUptodate(spage)) {
-				lock_page(spage);
-				unlock_page(spage);
+			k = (i >> PAGE_SHIFT) - pbegin;
+			spage[k] = xa_load(pool, i >> PAGE_SHIFT);
+			if (!PageUptodate(spage[k])) {
+				lock_page(spage[k]);
+				unlock_page(spage[k]);
 			}
-			holder = kmap_atomic(spage);
-			memcpy(tmp, holder + segment_left - i,
-			       segment_right - segment_left);
-			tmp += segment_right - segment_left;
-			kunmap_atomic(holder);
 		}
+		holder = vmap(&spage[0], pend - pbegin, VM_MAP, PAGE_KERNEL_RO);
+		src = holder + begin % PAGE_SIZE;
 	}
 
 	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
@@ -230,7 +225,11 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	if (single_page) {
 		kunmap_atomic(holder);
 	} else {
-		kfree(src);
+		vunmap(holder);
+		for (i = 0; i < pend - pbegin; i++) {
+			kunmap(holder);
+			holder += 4096;
+		}
 	}
 	kunmap_atomic(dst);
 
