@@ -8,7 +8,7 @@ Usage,
 
 `KROOT` set as kernel module develop kit path, ignored to use host kernel build environment
 
-## ovbd-loop
+## ovbd-loop (deprecated)
 
 This is a basic sample for dadi overlay-bd image block-device driver,
 currently implemented just like loop-device in kernel, reading image file via vfs to feed bio
@@ -56,11 +56,13 @@ It can be simply get ready by loop device:
 
 Say the loop device is `/dev/loop0` for example. Now able to create mapped device using `dmsetup`
 
-`dmsetup create --concise "vbd0,,,ro,0 2290872 lsmt_target 1 /dev/loop0"`
+`dmsetup create --concise "zfile0,,,ro,0 <zfile unzip size> zfile_target /dev/loop0 <lsmt actual size>"`
+
+`dmsetup create --concise "lsmt0,,,ro,0 2290872 lsmt_target /dev/zfile0 <lsmt actual size>"`
 
 Here the `vbd0` is device name for mapped-device (as `/dev/mapper/vbd0`), set `ro` flag to make sure
 device is read-only. 
-In table part, the target type is `lsmt_target`, then follows a parameter to referes LSMT layers number
+In table part, there are tow target types `zfile_target` and `lsmt_target`, then follows underlay lsmt format block parameter, path and length in bytes.
 (Currently supports only one layer). then the list of image devices.
 
 After the mapped-device ready, it could able to mount
