@@ -153,30 +153,6 @@ void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 	}
 }
 
-void zfile_close(struct vfile *f)
-{
-	struct zfile *zfile = (struct zfile *)f;
-	unsigned long index;
-	struct page *entry;
-
-	PRINT_INFO("close(%p)", (void *)f);
-	if (zfile) {
-		kthread_flush_worker(&zfile->worker);
-		kthread_stop(zfile->worker_task);
-
-		if (zfile->jump) {
-			vfree(zfile->jump);
-			zfile->jump = NULL;
-		}
-		zfile->fp = NULL;
-		xa_for_each (&zfile->cpages, index, entry) {
-			put_page(entry);
-		}
-		xa_destroy(&zfile->cpages);
-		kfree(zfile);
-	}
-}
-
 static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 {
 	void *dst = NULL;
@@ -479,6 +455,30 @@ IFile *zfile_open(const char *path)
 fail:
 	file->op->close(file);
 	return NULL;
+}
+
+void zfile_close(struct vfile *f)
+{
+	struct zfile *zfile = (struct zfile *)f;
+	unsigned long index;
+	struct page *entry;
+
+	PRINT_INFO("close(%p)", (void *)f);
+	if (zfile) {
+		kthread_flush_worker(&zfile->worker);
+		kthread_stop(zfile->worker_task);
+
+		if (zfile->jump) {
+			vfree(zfile->jump);
+			zfile->jump = NULL;
+		}
+		zfile->fp = NULL;
+		xa_for_each (&zfile->cpages, index, entry) {
+			put_page(entry);
+		}
+		xa_destroy(&zfile->cpages);
+		kfree(zfile);
+	}
 }
 
 bool is_zfile(struct vfile *file, struct zfile_ht *ht)

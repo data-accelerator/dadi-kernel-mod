@@ -135,7 +135,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	// mdt->nr = 1;
 
-	for (mdt->nr = 0; *args.argv; ) {
+	for (i = 0; *args.argv; i++) {
 		devname = dm_shift_arg(&args);
 		tail = dm_shift_arg(&args);
 		ret = kstrtoul(tail, 10, &len);
@@ -158,6 +158,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		pr_info("lsmt: file %d size %lu", i,
 			mdt->bf[i]->op->len(mdt->bf[i]));
 	}
+	mdt->nr = i;
 
 	// TODO: load multiple layer index
 	mdt->lsmt = lsmt_open_files(mdt->bf, 1);
