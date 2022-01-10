@@ -46,6 +46,11 @@
 static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 {
 	struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
+
+	if (!mdt) {
+		pr_err("LSMT DM Target not ready!!\n");
+		return DM_MAPIO_REQUEUE;
+	}
 	// printk(KERN_CRIT "\n<<in function lsmt_target_map \n");
 
 	switch (bio_op(bio)) {

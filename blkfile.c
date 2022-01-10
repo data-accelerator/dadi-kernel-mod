@@ -88,7 +88,8 @@ static ssize_t blkdev_pread(struct vfile *ctx, void *buf, size_t count,
 
 static void blkdev_close(struct vfile *ctx)
 {
-	kfree(ctx);
+	if (!ctx)
+		kfree(ctx);
 	return;
 }
 
@@ -102,6 +103,9 @@ static struct vfile_op blkdev_op = {
 
 IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
 {
+	if (IS_ERR(blk)) {
+		return NULL;
+	}
 	struct blkdev_as_vfile *ret =
 		kzalloc(sizeof(struct blkdev_as_vfile), GFP_KERNEL);
 	if (!ret)
