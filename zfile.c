@@ -202,10 +202,6 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 		kunmap_atomic(holder);
 	} else {
 		vunmap(holder);
-		for (i = 0; i < pend - pbegin; i++) {
-			kunmap(holder);
-			holder += 4096;
-		}
 	}
 	kunmap_atomic(dst);
 
