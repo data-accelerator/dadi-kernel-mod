@@ -61,8 +61,9 @@ struct zfile {
 	struct zfile_ht header;
 	struct jump_table *jump;
 	struct xarray cpages;
-	struct kthread_worker worker;
-	struct task_struct *worker_task;
+	struct workqueue_struct *wq;
+	struct kmem_cache *cmdpool;
+	mempool_t *pagepool;
 };
 
 // zfile functions

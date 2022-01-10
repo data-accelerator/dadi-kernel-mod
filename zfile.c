@@ -230,7 +230,7 @@ static void cpages_endio(struct bio *bio)
 }
 
 struct decompress_work {
-	struct kthread_work work;
+	struct work_struct work;
 	struct zfile *zf;
 	struct bio *bio;
 };
@@ -253,12 +253,12 @@ static void do_decompress(struct zfile *zf, struct bio *bio)
 	bio_endio(bio);
 }
 
-static void decompress_fn(struct kthread_work *work)
+static void decompress_fn(struct work_struct *work)
 {
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
 	do_decompress(cmd->zf, cmd->bio);
-	kfree(cmd);
+	kmem_cache_free(cmd->zf->cmdpool, cmd);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -314,14 +314,14 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	for (i = left; i < begin + range; i += PAGE_SIZE) {
 		page = xa_load(cpages, i >> PAGE_SHIFT);
 		if (!page) {
-			page = alloc_page(GFP_KERNEL);
+			page = mempool_alloc(zf->pagepool, GFP_KERNEL);
 			lock_page(page);
 			ClearPageUptodate(page);
 			fetch = xa_cmpxchg(cpages, i >> PAGE_SHIFT, NULL, page,
 					   GFP_KERNEL);
 			if (fetch) {
 				unlock_page(page);
-				put_page(page);
+				mempool_free(page, zf->pagepool);
 				page = fetch;
 			} else {
 				subbio = bio_alloc(GFP_KERNEL, 1);
@@ -336,12 +336,11 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 		}
 	}
 
-	struct decompress_work *cmd =
-		kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
+	struct decompress_work *cmd = kmem_cache_alloc(zf->cmdpool, GFP_KERNEL);
 	cmd->bio = bio;
 	cmd->zf = zf;
-	kthread_init_work(&cmd->work, &decompress_fn);
-	kthread_queue_work(&zf->worker, &cmd->work);
+	INIT_WORK(&cmd->work, decompress_fn);
+	queue_work(zf->wq, &cmd->work);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -351,11 +350,6 @@ static struct vfile_op zfile_ops = { .len = zfile_len,
 				     .bio_remap = zfile_bioremap,
 				     .close = zfile_close };
 
-static int zf_io_worker_fn(void *worker_ptr)
-{
-	current->flags |= PF_LOCAL_THROTTLE | PF_MEMALLOC_NOIO;
-	return kthread_worker_fn(worker_ptr);
-}
 IFile *zfile_open_by_file(struct vfile *file)
 {
 	uint32_t *jt_saved;
@@ -420,12 +414,16 @@ IFile *zfile_open_by_file(struct vfile *file)
 
 	zfile->vfile.op = &zfile_ops;
 
-	kthread_init_worker(&zfile->worker);
-	zfile->worker_task =
-		kthread_run(zf_io_worker_fn, &zfile->worker, "io thread init");
-	if (IS_ERR(zfile->worker_task))
+	const unsigned int onlinecpus = num_possible_cpus();
+	const unsigned int flags = WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE;
+	zfile->wq = alloc_workqueue("zfile_unzip", flags,
+				    onlinecpus + onlinecpus / 4);
+	if (IS_ERR(zfile->wq))
 		goto error_out;
-	set_user_nice(zfile->worker_task, MIN_NICE);
+	zfile->cmdpool = kmem_cache_create("zfile_cmd_pool",
+					   sizeof(struct decompress_work), 0,
+					   SLAB_RECLAIM_ACCOUNT, NULL);
+	zfile->pagepool = mempool_create_page_pool(4096, 0);
 
 	return (IFile *)zfile;
 
@@ -461,18 +459,18 @@ void zfile_close(struct vfile *f)
 
 	PRINT_INFO("close(%p)", (void *)f);
 	if (zfile) {
-		kthread_flush_worker(&zfile->worker);
-		kthread_stop(zfile->worker_task);
-
+		destroy_workqueue(zfile->wq);
 		if (zfile->jump) {
 			vfree(zfile->jump);
 			zfile->jump = NULL;
 		}
 		zfile->fp = NULL;
 		xa_for_each (&zfile->cpages, index, entry) {
-			put_page(entry);
+			mempool_free(entry, zfile->pagepool);
 		}
 		xa_destroy(&zfile->cpages);
+		mempool_destroy(zfile->pagepool);
+		kmem_cache_destroy(zfile->cmdpool);
 		kfree(zfile);
 	}
 }
