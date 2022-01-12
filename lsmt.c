@@ -88,21 +88,6 @@ static void trim_edge(void *m, const struct segment *bound_segment,
 	}
 }
 
-// static void trim_edge(struct segment_mapping *pm, size_t m,
-// 		      const struct segment_mapping *s)
-// {
-// 	struct segment_mapping *back;
-// 	if (m == 0)
-// 		return;
-// 	if (pm[0].offset < s->offset)
-// 		forward_offset_to(&pm[0], s->offset);
-
-// 	// back may be pm[0], when m == 1
-// 	back = &pm[m - 1];
-// 	if (segment_end(back) > segment_end(s))
-// 		backward_end_to(back, segment_end(s));
-// }
-
 const struct segment_mapping *
 ro_index_lower_bound(const struct lsmt_ro_index *index, uint64_t offset)
 {
@@ -389,6 +374,7 @@ void lsmt_close(IFile *ctx)
 		}
 	}
 	vfree(lsmt_file->index->mapping);
+	kfree(lsmt_file->index);
 	kfree(lsmt_file);
 }
 
@@ -465,6 +451,7 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	struct segment_mapping *mappings = (struct segment_mapping *)kmalloc(
 		sizeof(struct segment_mapping) * capacity, GFP_KERNEL);
 	if (!mappings) {
+		pr_err("Failed to alloc mapping memory\n");
 		goto err_ret;
 	}
 	PRINT_DEBUG("start merge indexes, layers: %lu", n);
@@ -476,7 +463,6 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	struct segment_mapping *tmp = (struct segment_mapping *)kmalloc(
 		size * sizeof(struct segment_mapping), GFP_KERNEL);
 	memcpy(tmp, mappings, size * sizeof(struct segment_mapping));
-	kfree(mappings);
 	if (!tmp || !ret)
 		goto err_ret;
 	ret->pbegin = tmp;
@@ -485,9 +471,9 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	return ret;
 
 err_ret:
-	kfree(mappings);
-	kfree(ret);
-	kfree(tmp);
+	if (mappings) kfree(mappings);
+	if (ret) kfree(ret);
+	if (tmp) kfree(tmp);
 	return NULL;
 }
 

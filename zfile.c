@@ -153,65 +153,6 @@ void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 	}
 }
 
-static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
-{
-	void *dst = NULL;
-	void *src, *holder;
-	size_t idx, c_cnt;
-	loff_t begin, end, pbegin, pend, i, k;
-	struct xarray *pool = &zf->cpages;
-	struct page *spage[3];
-	bool single_page;
-	int ret = 0;
-
-	dst = kmap_atomic(page);
-	idx = offset >> PAGE_SHIFT;
-	begin = zf->jump[idx].partial_offset;
-	end = zf->jump[idx].partial_offset + zf->jump[idx].delta;
-	c_cnt = zf->jump[idx].delta -
-		(zf->header.opt.verify ? sizeof(uint32_t) : 0);
-	pbegin = begin >> PAGE_SHIFT;
-	pend = (end + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	single_page = ((pend - pbegin) == 1);
-	BUG_ON(pend - pbegin > 3);
-	if (single_page) {
-		// data in same page
-		spage[0] = xa_load(pool, pbegin);
-		if (!PageUptodate(spage[0])) {
-			lock_page(spage[0]);
-			unlock_page(spage[0]);
-		}
-		holder = kmap_atomic(spage[0]);
-		src = holder + begin % PAGE_SIZE;
-	} else {
-		for (i = begin & PAGE_MASK; i < end; i += PAGE_SIZE) {
-			k = (i >> PAGE_SHIFT) - pbegin;
-			spage[k] = xa_load(pool, i >> PAGE_SHIFT);
-			if (!PageUptodate(spage[k])) {
-				lock_page(spage[k]);
-				unlock_page(spage[k]);
-			}
-		}
-		holder = vmap(&spage[0], pend - pbegin, VM_MAP, PAGE_KERNEL_RO);
-		src = holder + begin % PAGE_SIZE;
-	}
-
-	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
-
-	if (single_page) {
-		kunmap_atomic(holder);
-	} else {
-		vunmap(holder);
-	}
-	kunmap_atomic(dst);
-
-	if (ret < 0) {
-		pr_err("Decompress error\n");
-	}
-
-	return ret;
-}
-
 static void cpages_endio(struct bio *bio)
 {
 	struct bvec_iter_all iter;
@@ -229,6 +170,53 @@ static void cpages_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
+{
+	void *dst = NULL;
+	void *src, *holder;
+	size_t idx, c_cnt;
+	loff_t begin, end, pbegin, pend, i, k;
+	struct xarray *pool = &zf->cpages;
+	struct page *spage[3];
+	int ret = 0;
+
+	idx = offset >> PAGE_SHIFT;
+	begin = zf->jump[idx].partial_offset;
+	end = zf->jump[idx].partial_offset + zf->jump[idx].delta;
+	c_cnt = zf->jump[idx].delta -
+		(zf->header.opt.verify ? sizeof(uint32_t) : 0);
+	pbegin = begin >> PAGE_SHIFT;
+	pend = (end + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	BUG_ON(pend - pbegin > 3);
+	for (i = pbegin; i < pend; i++) {
+		k = i - pbegin;
+		spage[k] = xa_load(pool, i);
+		BUG_ON(!spage[k]);
+	}
+	for (i = 0; i < pend - pbegin; i++) {
+		lock_page(spage[i]);
+		unlock_page(spage[i]);
+		BUG_ON(!PageUptodate(spage[i]));
+		if (((pbegin + i + 1) << PAGE_SHIFT) <= end) {
+			ClearPageReserved(spage[i]);
+		}
+	}
+	holder = vm_map_ram(spage, pend - pbegin, numa_node_id());
+	src = holder + begin % PAGE_SIZE;
+
+	dst = kmap_atomic(page);
+	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
+	kunmap_atomic(dst);
+
+	vm_unmap_ram(holder, pend - pbegin);
+
+	if (ret < 0) {
+		pr_err("Decompress error\n");
+	}
+
+	return ret;
+}
+
 struct decompress_work {
 	struct work_struct work;
 	struct zfile *zf;
@@ -240,6 +228,25 @@ static void do_decompress(struct zfile *zf, struct bio *bio)
 	struct bio_vec bv;
 	struct bvec_iter iter;
 
+	size_t start_idx, end_idx, i, begin, range, left, right;
+	struct page *page;
+	loff_t offset, count;
+	size_t bs;
+	struct xarray *pool = &zf->cpages;
+
+	offset = bio->bi_iter.bi_sector;
+	count = bio_sectors(bio);
+	bs = zf->header.opt.block_size;
+
+	start_idx = (offset << SECTOR_SHIFT) / bs;
+	end_idx = ((offset + count - 1) << SECTOR_SHIFT) / bs;
+
+	begin = zf->jump[start_idx].partial_offset;
+	range = zf->jump[end_idx].partial_offset + zf->jump[end_idx].delta -
+		begin;
+	left = begin & PAGE_MASK;
+	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
+
 	bio_for_each_segment (bv, bio, iter) {
 		if (zf_decompress(zf, bv.bv_page,
 				  (iter.bi_sector << SECTOR_SHIFT) &
@@ -250,6 +257,19 @@ static void do_decompress(struct zfile *zf, struct bio *bio)
 			break;
 		}
 	}
+
+	for (i = left; i < right; i += PAGE_SIZE) {
+		page = xa_load(pool, i >> PAGE_SHIFT);
+		BUG_ON(!page);
+		put_page(page);
+		if (!PageReserved(page) && page_ref_count(page) == 1) {
+			if (xa_cmpxchg(pool, i >> PAGE_SHIFT, page, NULL,
+				       GFP_KERNEL) == page) {
+				mempool_free(page, zf->pagepool);
+			}
+		}
+	}
+
 	bio_endio(bio);
 }
 
@@ -270,7 +290,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	size_t bs = zf->header.opt.block_size;
 	size_t start_idx, end_idx;
 	struct bio *subbio = NULL;
-	struct page *page, *fetch;
+	struct page *page, *np, *bp;
 	loff_t begin, range, i, right, left;
 	struct xarray *cpages = &zf->cpages;
 	int nr_pages;
@@ -313,27 +333,31 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	// pre-alloc pages
 	for (i = left; i < begin + range; i += PAGE_SIZE) {
 		page = xa_load(cpages, i >> PAGE_SHIFT);
-		if (!page) {
-			page = mempool_alloc(zf->pagepool, GFP_KERNEL);
-			lock_page(page);
-			ClearPageUptodate(page);
-			fetch = xa_cmpxchg(cpages, i >> PAGE_SHIFT, NULL, page,
-					   GFP_KERNEL);
-			if (fetch) {
-				unlock_page(page);
-				mempool_free(page, zf->pagepool);
-				page = fetch;
+		if (!page || !PageReserved(page)) {
+			np = mempool_alloc(zf->pagepool, GFP_KERNEL);
+			SetPagePrivate(np);
+			SetPageReserved(np);
+			ClearPageUptodate(np);
+			bp = xa_cmpxchg(cpages, i >> PAGE_SHIFT, page, np,
+					GFP_KERNEL);
+			if (bp != page) {
+				// other threads requests before this one
+				page = bp;
+				mempool_free(np, zf->pagepool);
 			} else {
+				lock_page(np);
 				subbio = bio_alloc(GFP_KERNEL, 1);
-				bio_add_page(subbio, page, PAGE_SIZE, 0);
+				bio_add_page(subbio, np, PAGE_SIZE, 0);
 				bio_set_dev(subbio, dm_dev[0]->bdev);
 				bio_set_op_attrs(subbio, REQ_OP_READ, 0);
 				subbio->bi_end_io = cpages_endio;
 				subbio->bi_private = zf;
 				subbio->bi_iter.bi_sector = i >> SECTOR_SHIFT;
 				submit_bio(subbio);
+				page = np;
 			}
 		}
+		get_page(page);
 	}
 
 	struct decompress_work *cmd = kmem_cache_alloc(zf->cmdpool, GFP_KERNEL);
