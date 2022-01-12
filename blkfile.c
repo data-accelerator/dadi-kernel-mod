@@ -88,10 +88,14 @@ static ssize_t blkdev_pread(struct vfile *ctx, void *buf, size_t count,
 	size_t ret, tr;
 	ret = 0;
 	while (count) {
-		tr = sync_read_blkdev(bf->dev, buf,
-				      count > 65536 ? 65536 : count, offset);
+		tr = sync_read_blkdev(
+			bf->dev, buf,
+			count > 4 * PAGE_SIZE ? 4 * PAGE_SIZE : count, offset);
 		if (tr < 0) {
 			return tr;
+		}
+		if (tr == 0) {
+			return ret;
 		}
 		ret += tr;
 		buf += tr;
