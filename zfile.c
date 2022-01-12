@@ -265,7 +265,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio)
 		if (!PageReserved(page) && page_ref_count(page) == 1) {
 			if (xa_cmpxchg(pool, i >> PAGE_SHIFT, page, NULL,
 				       GFP_KERNEL) == page) {
-				mempool_free(page, zf->pagepool);
+				put_page(page);
 			}
 		}
 	}
@@ -278,7 +278,7 @@ static void decompress_fn(struct work_struct *work)
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
 	do_decompress(cmd->zf, cmd->bio);
-	kmem_cache_free(cmd->zf->cmdpool, cmd);
+	kfree(cmd);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -334,7 +334,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	for (i = left; i < begin + range; i += PAGE_SIZE) {
 		page = xa_load(cpages, i >> PAGE_SHIFT);
 		if (!page || !PageReserved(page)) {
-			np = mempool_alloc(zf->pagepool, GFP_KERNEL);
+			np = alloc_page(GFP_KERNEL);
 			SetPagePrivate(np);
 			SetPageReserved(np);
 			ClearPageUptodate(np);
@@ -343,7 +343,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			if (bp != page) {
 				// other threads requests before this one
 				page = bp;
-				mempool_free(np, zf->pagepool);
+				put_page(np);
 			} else {
 				lock_page(np);
 				subbio = bio_alloc(GFP_KERNEL, 1);
@@ -360,7 +360,8 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 		get_page(page);
 	}
 
-	struct decompress_work *cmd = kmem_cache_alloc(zf->cmdpool, GFP_KERNEL);
+	struct decompress_work *cmd =
+		kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
 	cmd->bio = bio;
 	cmd->zf = zf;
 	INIT_WORK(&cmd->work, decompress_fn);
@@ -416,8 +417,6 @@ IFile *zfile_open_by_file(struct vfile *file)
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
 	}
-	// PRINT_INFO("zfile: vlen=%lld size=%ld\n", zfile->header.vsize,
-	// 	zfile_len((struct vfile *)zfile));
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
@@ -444,10 +443,6 @@ IFile *zfile_open_by_file(struct vfile *file)
 				    onlinecpus + onlinecpus / 4);
 	if (IS_ERR(zfile->wq))
 		goto error_out;
-	zfile->cmdpool = kmem_cache_create("zfile_cmd_pool",
-					   sizeof(struct decompress_work), 0,
-					   SLAB_RECLAIM_ACCOUNT, NULL);
-	zfile->pagepool = mempool_create_page_pool(4096, 0);
 
 	return (IFile *)zfile;
 
@@ -490,11 +485,10 @@ void zfile_close(struct vfile *f)
 		}
 		zfile->fp = NULL;
 		xa_for_each (&zfile->cpages, index, entry) {
-			mempool_free(entry, zfile->pagepool);
+			while (page_ref_count(entry))
+				put_page(entry);
 		}
 		xa_destroy(&zfile->cpages);
-		mempool_destroy(zfile->pagepool);
-		kmem_cache_destroy(zfile->cmdpool);
 		kfree(zfile);
 	}
 }
