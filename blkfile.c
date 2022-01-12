@@ -23,7 +23,7 @@ static ssize_t sync_read_blkdev(struct block_device *dev, void *buf,
 
 	nr_pages = (right - left + PAGE_SIZE - 1) / PAGE_SIZE;
 	bio = bio_alloc(GFP_KERNEL, nr_pages);
-	if (!bio) {
+	if (IS_ERR(bio)) {
 		ret = -EIO;
 		goto out;
 	}
@@ -67,8 +67,10 @@ static ssize_t sync_read_blkdev(struct block_device *dev, void *buf,
 		kunmap_atomic(mem);
 	}
 out:
-	bio_free_pages(bio);
-	bio_put(bio);
+	if (!IS_ERR(bio)) {
+		bio_free_pages(bio);
+		bio_put(bio);
+	}
 	return ret;
 }
 
@@ -83,7 +85,20 @@ static ssize_t blkdev_pread(struct vfile *ctx, void *buf, size_t count,
 			    loff_t offset)
 {
 	struct blkdev_as_vfile *bf = (struct blkdev_as_vfile *)ctx;
-	return sync_read_blkdev(bf->dev, buf, count, offset);
+	size_t ret, tr;
+	ret = 0;
+	while (count) {
+		tr = sync_read_blkdev(bf->dev, buf,
+				      count > 65536 ? 65536 : count, offset);
+		if (tr < 0) {
+			return tr;
+		}
+		ret += tr;
+		buf += tr;
+		offset += tr;
+		count -= tr;
+	}
+	return ret;
 }
 
 static void blkdev_close(struct vfile *ctx)
