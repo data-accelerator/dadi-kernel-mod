@@ -201,14 +201,14 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 			ClearPageReserved(spage[i]);
 		}
 	}
+	dst = kmap_atomic(page);
 	holder = vm_map_ram(spage, pend - pbegin, numa_node_id());
 	src = holder + begin % PAGE_SIZE;
 
-	dst = kmap_atomic(page);
 	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
-	kunmap_atomic(dst);
 
 	vm_unmap_ram(holder, pend - pbegin);
+	kunmap_atomic(dst);
 
 	if (ret < 0) {
 		pr_err("Decompress error\n");
@@ -263,8 +263,8 @@ static void do_decompress(struct zfile *zf, struct bio *bio)
 		BUG_ON(!page);
 		put_page(page);
 		if (!PageReserved(page) && page_ref_count(page) == 1) {
-			if (xa_cmpxchg(pool, i >> PAGE_SHIFT, page, NULL,
-				       GFP_KERNEL) == page) {
+			if (xa_cmpxchg_bh(pool, i >> PAGE_SHIFT, page, NULL,
+					  GFP_KERNEL) == page) {
 				put_page(page);
 			}
 		}
@@ -338,8 +338,8 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			SetPagePrivate(np);
 			SetPageReserved(np);
 			ClearPageUptodate(np);
-			bp = xa_cmpxchg(cpages, i >> PAGE_SHIFT, page, np,
-					GFP_KERNEL);
+			bp = xa_cmpxchg_bh(cpages, i >> PAGE_SHIFT, page, np,
+					   GFP_KERNEL);
 			if (bp != page) {
 				// other threads requests before this one
 				page = bp;
@@ -397,26 +397,25 @@ IFile *zfile_open_by_file(struct vfile *file)
 	zfile->fp = file;
 
 	// should verify header
-	if (!is_header_overwrite(&zfile->header)) {
-		file_size = zfile->fp->op->len(zfile->fp);
-		tailer_offset = file_size - ZF_SPACE;
-		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-			   tailer_offset);
-		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-					   sizeof(struct zfile_ht),
-					   tailer_offset);
-		PRINT_INFO(
-			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-			"verify=%d",
-			zfile->header.vsize, zfile->header.index_offset,
-			zfile->header.index_size, zfile->header.opt.verify);
-	} else {
-		PRINT_INFO(
-			"zfile header overwrite: size=%lld index_offset=%lld "
-			"index_size=%lld verify=%d",
-			zfile->header.vsize, zfile->header.index_offset,
-			zfile->header.index_size, zfile->header.opt.verify);
-	}
+	//	if (!is_header_overwrite(&zfile->header)) {
+	file_size = zfile->fp->op->len(zfile->fp);
+	tailer_offset = file_size - ZF_SPACE;
+	PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
+		   tailer_offset);
+	ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
+				   sizeof(struct zfile_ht), tailer_offset);
+	PRINT_INFO(
+		"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+		"verify=%d",
+		zfile->header.vsize, zfile->header.index_offset,
+		zfile->header.index_size, zfile->header.opt.verify);
+	//	} else {
+	//		PRINT_INFO(
+	//			"zfile header overwrite: size=%lld index_offset=%lld "
+	//			"index_size=%lld verify=%d",
+	//			zfile->header.vsize, zfile->header.index_offset,
+	//			zfile->header.index_size, zfile->header.opt.verify);
+	//	}
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
@@ -484,10 +483,6 @@ void zfile_close(struct vfile *f)
 			zfile->jump = NULL;
 		}
 		zfile->fp = NULL;
-		xa_for_each (&zfile->cpages, index, entry) {
-			while (page_ref_count(entry))
-				put_page(entry);
-		}
 		xa_destroy(&zfile->cpages);
 		kfree(zfile);
 	}
