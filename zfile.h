@@ -60,7 +60,6 @@ struct zfile {
 	bool onwership;
 	struct zfile_ht header;
 	struct jump_table *jump;
-	struct xarray cpages;
 	struct workqueue_struct *wq;
 };
 
