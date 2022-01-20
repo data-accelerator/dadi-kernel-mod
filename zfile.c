@@ -154,43 +154,27 @@ void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 }
 
 static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
-			 struct block_device *bdev)
+			 void *holder, loff_t holder_off)
 {
 	void *dst = NULL;
-	void *src, *holder;
+	void *src = NULL;
 	size_t idx, c_cnt;
-	loff_t begin, end, pbegin, pend, i;
-	struct address_space *mapping = bdev->bd_inode->i_mapping;
-	struct page *spage[3];
+	loff_t begin;
 	int ret = 0;
-	BUG_ON(!mapping);
+	BUG_ON(!holder);
 
 	idx = offset >> PAGE_SHIFT;
 	begin = zf->jump[idx].partial_offset;
-	end = zf->jump[idx].partial_offset + zf->jump[idx].delta;
 	c_cnt = zf->jump[idx].delta -
 		(zf->header.opt.verify ? sizeof(uint32_t) : 0);
-	pbegin = begin >> PAGE_SHIFT;
-	pend = (end + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	BUG_ON(pend - pbegin > 3);
-
-	// pages are locked, so always able to fetch
-	find_get_pages_contig(mapping, pbegin, pend - pbegin, spage);
 
 	dst = kmap_atomic(page);
 	BUG_ON(!dst);
-	holder = vm_map_ram(spage, pend - pbegin, numa_node_id());
-	BUG_ON(!holder);
-	src = holder + begin % PAGE_SIZE;
+	src = holder + (begin - holder_off);
 
 	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
 
-	vm_unmap_ram(holder, pend - pbegin);
 	kunmap_atomic(dst);
-
-	for (i = 0; i < pend - pbegin; i++) {
-		put_page(spage[i]);
-	}
 
 	if (ret < 0) {
 		pr_err("Decompress error\n");
@@ -203,11 +187,11 @@ struct decompress_work {
 	struct work_struct work;
 	struct zfile *zf;
 	struct bio *bio;
-	struct block_device *bdev;
+	struct address_space *mapping;
 };
 
 static void do_decompress(struct zfile *zf, struct bio *bio,
-			  struct block_device *bdev)
+			  struct address_space *mapping)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
@@ -216,7 +200,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 	struct page **pages;
 	loff_t offset, count, nr;
 	size_t bs;
-	struct address_space *mapping = bdev->bd_inode->i_mapping;
+	void *holder = NULL;
 
 	offset = bio->bi_iter.bi_sector;
 	count = bio_sectors(bio);
@@ -236,17 +220,22 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 			GFP_KERNEL);
 
 	for (i = 0; i < nr; i++) {
-		pages[i] = read_cache_page(mapping, i + (left >> PAGE_SHIFT),
-					   NULL, NULL);
+		pages[i] = find_get_page(mapping, i + (left >> PAGE_SHIFT));
+		BUG_ON(!pages[i] || PageError(pages[i]));
 		lock_page(pages[i]);
 	}
 
+	holder = vm_map_ram(pages, nr, 0);
+
+	for (i = 0; i < nr; i++) {
+		unlock_page(pages[i]);
+	}
 	// now pages are referenced, will not release
 
 	bio_for_each_segment (bv, bio, iter) {
 		if (zf_decompress(zf, bv.bv_page,
 				  (iter.bi_sector << SECTOR_SHIFT) & PAGE_MASK,
-				  bdev) < 0) {
+				  holder, left) < 0) {
 			pr_err("ZFile: error decompressing %llu\n",
 			       (iter.bi_sector << SECTOR_SHIFT) & PAGE_MASK);
 			bio_io_error(bio);
@@ -254,15 +243,19 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 		}
 	}
 
+	vm_unmap_ram(holder, nr);
+
 	for (i = 0; i < nr; i++) {
+		// need put twice
+		// since outside already get once
 		put_page(pages[i]);
-		unlock_page(pages[i]);
+		put_page(pages[i]);
 	}
 
 	kfree(pages);
 
-	if (begin + range < right) {
-		right -= PAGE_SHIFT;
+	if (begin + range == right) {
+		right += PAGE_SHIFT;
 	}
 	if (right > left) {
 		invalidate_mapping_pages(mapping, left >> PAGE_SHIFT,
@@ -278,8 +271,30 @@ static void decompress_fn(struct work_struct *work)
 		container_of(work, struct decompress_work, work);
 	BUG_ON(!work);
 	BUG_ON(!cmd);
-	do_decompress(cmd->zf, cmd->bio, cmd->bdev);
+	do_decompress(cmd->zf, cmd->bio, cmd->mapping);
 	kfree(cmd);
+}
+
+static void zfile_raw_endio(struct bio *bio)
+{
+	struct bio_vec *bvec;
+	blk_status_t err = bio->bi_status;
+	struct bvec_iter_all iter_all;
+	// pr_info(">>> endio");
+	bio_for_each_segment_all (bvec, bio, iter_all) {
+		struct page *page = bvec->bv_page;
+
+		/* page is already locked */
+		BUG_ON(PageUptodate(page));
+		if (err)
+			SetPageError(page);
+		else
+			SetPageUptodate(page);
+		// pr_info("!!! endio for page %ld\n", page->index);
+		unlock_page(page);
+		/* page could be reclaimed now */
+	}
+	bio_put(bio);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -290,8 +305,8 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	size_t count = bio_sectors(bio);
 	size_t bs = zf->header.opt.block_size;
 	size_t start_idx, end_idx;
-	loff_t begin, range, right, left;
-	struct address_space *map = dm_dev[0]->bdev->bd_inode->i_mapping;
+	loff_t begin, range, right, left, i;
+	struct page *page;
 	int nr_pages;
 
 	if (nr != 1 || !dm_dev[0]) {
@@ -328,14 +343,33 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
 	nr_pages = (right - left) >> PAGE_SHIFT;
 
-	page_cache_readahead_unbounded(map, NULL, left >> PAGE_SHIFT, nr_pages,
-				       0);
+	struct address_space *mapping = dm_dev[0]->bdev->bd_inode->i_mapping;
+
+	for (i = left; i < right; i += PAGE_SIZE) {
+		page = find_get_page(mapping, i >> PAGE_SHIFT);
+		if (!page) {
+			page = __page_cache_alloc(GFP_KERNEL);
+			if (!page) {
+				return DM_MAPIO_KILL;
+			}
+			lock_page(page);
+			add_to_page_cache_lru(page, mapping, i >> PAGE_SHIFT,
+					      GFP_KERNEL);
+			struct bio *sbio = bio_alloc(GFP_KERNEL, 1);
+			bio_add_page(sbio, page, PAGE_SIZE, 0);
+			bio_set_dev(sbio, dm_dev[0]->bdev);
+			bio_set_op_attrs(sbio, REQ_OP_READ, 0);
+			sbio->bi_iter.bi_sector = i >> SECTOR_SHIFT;
+			sbio->bi_end_io = zfile_raw_endio;
+			submit_bio(sbio);
+		}
+	}
 
 	struct decompress_work *cmd =
 		kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
 	cmd->bio = bio;
 	cmd->zf = zf;
-	cmd->bdev = dm_dev[0]->bdev;
+	cmd->mapping = mapping;
 	INIT_WORK(&cmd->work, decompress_fn);
 	queue_work(zf->wq, &cmd->work);
 	return DM_MAPIO_SUBMITTED;
