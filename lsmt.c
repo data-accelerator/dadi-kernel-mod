@@ -148,11 +148,7 @@ struct lsmt_ro_index *
 create_memory_index(const struct segment_mapping *pmappings, size_t n,
 		    uint64_t moffset_begin, uint64_t moffset_end, bool copy)
 {
-	// bool ok0 = verify_mapping_order(pmappings, n);
-	// bool ok1 = verify_mapping_moffset(pmappings, n,
-	//                                  moffset_begin, moffset_end);
 	struct lsmt_ro_index *ret = NULL;
-	// if (ok0 & ok1) {
 	int index_size = sizeof(struct lsmt_ro_index);
 	if (copy) {
 		index_size += sizeof(struct segment_mapping) * n;
@@ -208,105 +204,69 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 	// actually, split bio by segment, summit and call endio when all split bio
 	// are done
 
-	s.offset = bio->bi_iter.bi_sector;
-	s.length = bio_sectors(bio);
 	bio->bi_status = BLK_STS_OK;
-	// pr_info("lsmt remap: s.offset=%lu s.length=%u\n", 0UL+s.offset, s.length);
 	while (true) {
+		s.offset = bio->bi_iter.bi_sector;
+		s.length = bio_sectors(bio);
 		int n = ro_index_lookup(fp->index, &s, m, 16);
 		for (i = 0; i < n; ++i) {
-			BUG_ON(s.offset != bio->bi_iter.bi_sector || s.length != bio_sectors(bio));
 			if (s.offset < m[i].offset) {
 				// hole
-				if (m[i].offset - s.offset < s.length) {
-					// pr_info("Fill zero by hole at %lld\n",
-					// 	s.offset);
+				if (m[i].offset - s.offset < bio_sectors(bio)) {
 					subbio = bio_split(
 						bio, m[i].offset - s.offset,
 						GFP_NOIO, NULL);
-					bio_chain(subbio, bio);
+					// bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
+					s.length -= m[i].offset - s.offset;
+					s.offset = m[i].offset;
 				} else {
-					// pr_info("Fill zero by hole at %lld\n",
-					// 	bio->bi_iter.bi_sector);
 					zero_fill_bio(bio);
 					bio_endio(bio);
 					return DM_MAPIO_SUBMITTED;
 				}
-				s.length -= m[i].offset - s.offset;
-				s.offset = m[i].offset;
 			}
 			// zeroe block
 			if (m[i].zeroed) {
-				if (m[i].offset + m[i].length - s.offset <
-				    s.length) {
-					// pr_info("Fill zero by block at %lld\n",
-					// 	s.offset);
-					subbio = bio_split(bio,
-							   m[i].offset +
-								   m[i].length -
-								   s.offset,
+				if (m[i].length < bio_sectors(bio)) {
+					subbio = bio_split(bio, m[i].length,
 							   GFP_NOIO, NULL);
 					bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
-					s.length -= m[i].offset + m[i].length -
-						    s.offset;
+					s.length -= m[i].length;
 					s.offset = m[i].offset + m[i].length;
 				} else {
-					// pr_info("Fill zero by block at %lld\n",
-					// 	s.offset);
 					zero_fill_bio(bio);
 					bio_endio(bio);
 					return DM_MAPIO_SUBMITTED;
 				}
 			} else {
-				bio_set_dev(bio, dev[0]->bdev);
-				if (m[i].offset + m[i].length - s.offset <
-				    s.length) {
-					// pr_info("Partial forward block at %lld count %lld [in block %lld %lld] to %lld\n",
-					// 	s.offset,
-					// 	m[i].offset + m[i].length -
-					// 		s.offset,
-					// 	m[i].offset, m[i].length,
-					// 	m[i].moffset);
-					subbio = bio_split(bio,
-							   m[i].offset +
-								   m[i].length -
-								   s.offset,
+				bio_set_dev(bio, dev[m[i].tag]->bdev);
+				if (m[i].length < bio_sectors(bio)) {
+					subbio = bio_split(bio, m[i].length,
 							   GFP_NOIO, NULL);
 					subbio->bi_iter.bi_sector =
-						m[i].moffset + s.offset -
-						m[i].offset;
+						m[i].moffset;
 					bio_chain(subbio, bio);
 					submit_bio(subbio);
-					s.length -= m[i].offset + m[i].length -
-						   s.offset;
+					s.length -= m[i].length;
 					s.offset = m[i].offset + m[i].length;
 				} else {
-					// pr_info("Forward block at %lld count %lld to %lld\n",
-					// 	s.offset, m[i].length,
-					// 	m[i].moffset);
-					bio->bi_iter.bi_sector = m[i].moffset +
-								 s.offset -
-								 m[i].offset;
+					bio->bi_iter.bi_sector = m[i].moffset;
 					submit_bio(bio);
 					return DM_MAPIO_SUBMITTED;
 				}
 			}
-			forward_offset_to(&s, segment_end(&(m[i])),
-					  TYPE_SEGMENT);
-			// pr_info("Forward offset to %lld\n", s.offset);
 		}
 		if (n < 16)
 			break;
 	}
 	if (s.length > 0) {
-		// pr_info("Extra empty %lld %lld\n", s.offset, s.length);
 		zero_fill_bio(bio);
-		bio_endio(bio);
 	}
+	bio_endio(bio);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -334,7 +294,7 @@ ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset)
 		PRINT_INFO("LSMT: %lld %lu over tail\n", offset, count);
 		count = lsmt_file->ht.virtual_size - offset;
 	}
-	m = kmalloc(16 * sizeof(struct segment_mapping), GFP_NOIO);
+	m = kmalloc(16 * sizeof(struct segment_mapping), GFP_KERNEL);
 	s.offset = offset / SECTOR_SIZE;
 	s.length = count / SECTOR_SIZE;
 	while (true) {

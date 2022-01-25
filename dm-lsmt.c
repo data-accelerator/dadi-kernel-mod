@@ -109,37 +109,6 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
-	// dmt->lsmt = lsmt_open_ro(x, 1)
-
-	// if (sscanf(argv[1], "%llu", &start) != 1) {
-	//     ti->error = "dm-lsmt_target: Invalid device sector";
-	//     goto bad;
-	// }
-
-	// mdt->start = (sector_t)start;
-
-	/* dm_get_table_mode
-     * Gives out you the Permissions of device mapper table.
-     * This table is nothing but the table which gets created
-     * when we execute dmsetup create. This is one of the
-     * Data structure used by device mapper for keeping track of its devices.
-     *
-     * dm_get_device
-     * The function sets the mdt->dev field to underlying device dev structure.
-     */
-
-	// r = dm_read_arg_group(&arg, &args, &mdt->nr, &ti->error);
-	// if (r)
-	// 	return -EINVAL;
-
-	// if (mdt->nr != 1) {
-	// 	printk(KERN_CRIT "\n Merged lsmtfile not implemented");
-	// 	ti->error = "dm-lsmt_target: Merged lsmtfile not implemented";
-	// 	return -ENOSYS;
-	// }
-
-	// mdt->nr = 1;
-
 	for (i = 0; *args.argv; i++) {
 		devname = dm_shift_arg(&args);
 		tail = dm_shift_arg(&args);

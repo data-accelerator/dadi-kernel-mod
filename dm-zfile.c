@@ -129,7 +129,7 @@ static int zfile_target_ctr(struct dm_target *ti, unsigned int argc,
 		pr_warn("failed to get file length");
 		goto error_out;
 	}
-	// pr_info("zfile len set to %lu\n", zflen);
+
 	mdt->bf = (struct vfile *)open_blkdev_as_vfile(mdt->dev->bdev, zflen);
 
 	mdt->zfile = zfile_open_by_file((struct vfile *)mdt->bf);

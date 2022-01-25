@@ -185,6 +185,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 
 struct decompress_work {
 	struct work_struct work;
+	// struct kthread_work work;
 	struct zfile *zf;
 	struct bio *bio;
 	struct address_space *mapping;
@@ -220,16 +221,13 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 			GFP_KERNEL);
 
 	for (i = 0; i < nr; i++) {
-		pages[i] = find_get_page(mapping, i + (left >> PAGE_SHIFT));
+		pages[i] = read_cache_page_gfp(
+			mapping, i + (left >> PAGE_SHIFT), GFP_KERNEL);
 		BUG_ON(!pages[i] || PageError(pages[i]));
-		lock_page(pages[i]);
 	}
 
-	holder = vm_map_ram(pages, nr, 0);
+	holder = vm_map_ram(pages, nr, -1);
 
-	for (i = 0; i < nr; i++) {
-		unlock_page(pages[i]);
-	}
 	// now pages are referenced, will not release
 
 	bio_for_each_segment (bv, bio, iter) {
@@ -243,12 +241,11 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 		}
 	}
 
-	vm_unmap_ram(holder, nr);
+	vm_unmap_aliases();
 
 	for (i = 0; i < nr; i++) {
 		// need put twice
 		// since outside already get once
-		put_page(pages[i]);
 		put_page(pages[i]);
 	}
 
@@ -275,26 +272,14 @@ static void decompress_fn(struct work_struct *work)
 	kfree(cmd);
 }
 
-static void zfile_raw_endio(struct bio *bio)
+static unsigned int cpuidx;
+static void zfile_queue_work(int cpus, struct workqueue_struct *wq,
+			     struct work_struct *work)
 {
-	struct bio_vec *bvec;
-	blk_status_t err = bio->bi_status;
-	struct bvec_iter_all iter_all;
-	// pr_info(">>> endio");
-	bio_for_each_segment_all (bvec, bio, iter_all) {
-		struct page *page = bvec->bv_page;
-
-		/* page is already locked */
-		BUG_ON(PageUptodate(page));
-		if (err)
-			SetPageError(page);
-		else
-			SetPageUptodate(page);
-		// pr_info("!!! endio for page %ld\n", page->index);
-		unlock_page(page);
-		/* page could be reclaimed now */
-	}
-	bio_put(bio);
+	int idx;
+	do {
+		idx = cpuidx ++;
+	} while (!queue_work_on(idx % cpus, wq, work));
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -305,8 +290,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	size_t count = bio_sectors(bio);
 	size_t bs = zf->header.opt.block_size;
 	size_t start_idx, end_idx;
-	loff_t begin, range, right, left, i;
-	struct page *page;
+	loff_t begin, range, right, left;
 	int nr_pages;
 
 	if (nr != 1 || !dm_dev[0]) {
@@ -344,34 +328,18 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	nr_pages = (right - left) >> PAGE_SHIFT;
 
 	struct address_space *mapping = dm_dev[0]->bdev->bd_inode->i_mapping;
-
-	for (i = left; i < right; i += PAGE_SIZE) {
-		page = find_get_page(mapping, i >> PAGE_SHIFT);
-		if (!page) {
-			page = __page_cache_alloc(GFP_KERNEL);
-			if (!page) {
-				return DM_MAPIO_KILL;
-			}
-			lock_page(page);
-			add_to_page_cache_lru(page, mapping, i >> PAGE_SHIFT,
-					      GFP_KERNEL);
-			struct bio *sbio = bio_alloc(GFP_KERNEL, 1);
-			bio_add_page(sbio, page, PAGE_SIZE, 0);
-			bio_set_dev(sbio, dm_dev[0]->bdev);
-			bio_set_op_attrs(sbio, REQ_OP_READ, 0);
-			sbio->bi_iter.bi_sector = i >> SECTOR_SHIFT;
-			sbio->bi_end_io = zfile_raw_endio;
-			submit_bio(sbio);
-		}
-	}
+	page_cache_readahead_unbounded(mapping, NULL, left >> PAGE_SHIFT,
+				       nr_pages, 0);
 
 	struct decompress_work *cmd =
 		kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
+
+	INIT_WORK(&cmd->work, decompress_fn);
 	cmd->bio = bio;
 	cmd->zf = zf;
 	cmd->mapping = mapping;
-	INIT_WORK(&cmd->work, decompress_fn);
-	queue_work(zf->wq, &cmd->work);
+
+	zfile_queue_work(zf->onlinecpus, zf->wq, &cmd->work);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -440,10 +408,9 @@ IFile *zfile_open_by_file(struct vfile *file)
 	vfree(jt_saved);
 
 	zfile->vfile.op = &zfile_ops;
-
-	const unsigned int onlinecpus = num_possible_cpus();
+	zfile->onlinecpus = num_possible_cpus();
 	const unsigned int flags = WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE;
-	zfile->wq = alloc_workqueue("zfile_unzip", flags, onlinecpus);
+	zfile->wq = alloc_workqueue("zfile_unzip", flags, zfile->onlinecpus);
 	if (IS_ERR(zfile->wq))
 		goto error_out;
 
@@ -479,6 +446,7 @@ void zfile_close(struct vfile *f)
 
 	PRINT_INFO("close(%p)", (void *)f);
 	if (zfile) {
+		flush_workqueue(zfile->wq);
 		destroy_workqueue(zfile->wq);
 		if (zfile->jump) {
 			vfree(zfile->jump);
