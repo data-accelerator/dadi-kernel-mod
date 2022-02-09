@@ -61,6 +61,7 @@ struct zfile {
 	struct zfile_ht header;
 	struct jump_table *jump;
 	struct workqueue_struct *wq;
+	struct address_space *umap;
 	int onlinecpus;
 };
 
