@@ -247,58 +247,6 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 	}
 }
 
-static void decompress_fn(struct work_struct *work)
-{
-	size_t start_idx, end_idx, begin, range, left, right;
-	loff_t offset, count, nr;
-	size_t bs;
-	struct compressed_page *cp;
-	struct decompress_work *cmd =
-		container_of(work, struct decompress_work, work);
-	BUG_ON(!work);
-	BUG_ON(!cmd);
-	offset = cmd->bio->bi_iter.bi_sector;
-	count = bio_sectors(cmd->bio);
-	bs = cmd->zf->header.opt.block_size;
-
-	start_idx = (offset << SECTOR_SHIFT) / bs;
-	end_idx = ((offset + count - 1) << SECTOR_SHIFT) / bs;
-
-	begin = cmd->zf->jump[start_idx].partial_offset;
-	range = cmd->zf->jump[end_idx].partial_offset +
-		cmd->zf->jump[end_idx].delta - begin;
-	left = begin & PAGE_MASK;
-	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
-	nr = (right - left) >> PAGE_SHIFT;
-
-	list_for_each_entry (cp, &cmd->pagelist, list) {
-		if (!PageUptodate(cp->page)) {
-			lock_page(cp->page);
-			unlock_page(cp->page);
-			BUG_ON(!PageUptodate(cp->page));
-		}
-	}
-
-	do_decompress(cmd->zf, cmd->bio, cmd->mapping, &cmd->pagelist, left,
-		      nr);
-
-	if (begin + range == right) {
-		right += PAGE_SHIFT;
-	}
-	if (right > left) {
-		invalidate_mapping_pages(cmd->mapping, left >> PAGE_SHIFT,
-					 right >> PAGE_SHIFT);
-	}
-	kfree(cmd);
-}
-
-struct readahead_work {
-	struct work_struct work;
-	struct address_space *mapping;
-	loff_t left;
-	int nr;
-};
-
 void zfile_readahead(struct address_space *mapping, loff_t left, int nr)
 {
 	page_cache_readahead_unbounded(mapping, NULL, left >> PAGE_SHIFT, nr,
@@ -328,15 +276,95 @@ static void zfile_readendio(struct bio *bio)
 	bio_put(bio);
 }
 
-static void list_move_all(struct list_head *old, struct list_head *new)
+static void zfile_fillbio(struct zfile *zf, struct bio *bio, struct dm_dev *dev)
 {
-	struct list_head *first = old->next;
-	struct list_head *last = old->prev;
-	INIT_LIST_HEAD(old);
-	first->prev = new;
-	last->next = new;
-	new->prev = last;
-	new->next = first;
+	loff_t offset = bio->bi_iter.bi_sector;
+	size_t count = bio_sectors(bio);
+	size_t bs = zf->header.opt.block_size;
+	size_t start_idx, end_idx;
+	loff_t begin, range, right, left, i;
+	int nr_pages;
+	struct compressed_page *cp;
+	struct bio *sbio;
+
+	start_idx = (offset << SECTOR_SHIFT) / bs;
+	end_idx = ((offset + count - 1) << SECTOR_SHIFT) / bs;
+
+	begin = zf->jump[start_idx].partial_offset;
+	range = zf->jump[end_idx].partial_offset + zf->jump[end_idx].delta -
+		begin;
+	left = begin & PAGE_MASK;
+	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
+	nr_pages = (right - left) >> PAGE_SHIFT;
+
+	struct address_space *mapping = dev->bdev->bd_inode->i_mapping;
+
+	// struct blk_plug plug;
+
+	// blk_start_plug(&plug);
+
+	LIST_HEAD(pagelist);
+
+	for (i = 0; i < nr_pages; i++) {
+		cp = kmalloc(sizeof(struct compressed_page), GFP_NOIO);
+		list_add_tail(&cp->list, &pagelist);
+		cp->page = find_or_create_page(
+			mapping, i + (left >> PAGE_SHIFT), GFP_NOIO);
+		cp->underlay_offset = left + (i << PAGE_SHIFT);
+		BUG_ON(!cp->page);
+		if (!PageUptodate(cp->page)) {
+			sbio = bio_alloc(GFP_NOIO, 1);
+			BUG_ON(!sbio);
+			bio_add_page(sbio, cp->page, PAGE_SIZE, 0);
+			bio_set_dev(sbio, dev->bdev);
+			bio_set_op_attrs(sbio, REQ_OP_READ, 0);
+			sbio->bi_iter.bi_sector =
+				((i << PAGE_SHIFT) + left) >> SECTOR_SHIFT;
+			sbio->bi_iter.bi_size = PAGE_SIZE;
+			sbio->bi_end_io = zfile_readendio;
+			submit_bio(sbio);
+		} else {
+			unlock_page(cp->page);
+		}
+	}
+
+	zfile_readahead(mapping, right, 64);
+
+	// blk_finish_plug(&plug);
+
+	// possable online decompress
+	list_for_each_entry (cp, &pagelist, list) {
+		if (!PageUptodate(cp->page)) {
+			lock_page(cp->page);
+			unlock_page(cp->page);
+			BUG_ON(!PageUptodate(cp->page));
+		}
+	}
+
+	do_decompress(zf, bio, mapping, &pagelist, left, nr_pages);
+
+	if (begin + range == right) {
+		right += PAGE_SHIFT;
+	}
+	if (right > left) {
+		invalidate_mapping_pages(mapping, left >> PAGE_SHIFT,
+					 right >> PAGE_SHIFT);
+	}
+}
+
+struct fillbio_work {
+	struct work_struct work;
+	struct zfile *zf;
+	struct bio *bio;
+	struct dm_dev *dev;
+};
+
+static void fillbio_fn(struct work_struct *work)
+{
+	struct fillbio_work *cmd =
+		container_of(work, struct fillbio_work, work);
+	zfile_fillbio(cmd->zf, cmd->bio, cmd->dev);
+	kfree(work);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -345,13 +373,6 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	struct zfile *zf = (struct zfile *)ctx;
 	loff_t offset = bio->bi_iter.bi_sector;
 	size_t count = bio_sectors(bio);
-	size_t bs = zf->header.opt.block_size;
-	size_t start_idx, end_idx;
-	loff_t begin, range, right, left, i;
-	int nr_pages;
-	struct decompress_work *cmd;
-	struct compressed_page *cp;
-	int miss = 0;
 
 	if (unlikely(nr != 1 || !dm_dev[0])) {
 		pr_err("ZFile: nr wrong\n");
@@ -377,74 +398,13 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
-	start_idx = (offset << SECTOR_SHIFT) / bs;
-	end_idx = ((offset + count - 1) << SECTOR_SHIFT) / bs;
 
-	begin = zf->jump[start_idx].partial_offset;
-	range = zf->jump[end_idx].partial_offset + zf->jump[end_idx].delta -
-		begin;
-	left = begin & PAGE_MASK;
-	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
-	nr_pages = (right - left) >> PAGE_SHIFT;
-
-	struct address_space *mapping = dm_dev[0]->bdev->bd_inode->i_mapping;
-
-	struct blk_plug plug;
-
-	blk_start_plug(&plug);
-
-	LIST_HEAD(pagelist);
-
-	for (i = 0; i < nr_pages; i++) {
-		cp = kmalloc(sizeof(struct compressed_page), GFP_NOIO);
-		list_add_tail(&cp->list, &pagelist);
-		cp->page = find_or_create_page(
-			mapping, i + (left >> PAGE_SHIFT), GFP_NOIO);
-		cp->underlay_offset = left + (i << PAGE_SHIFT);
-		BUG_ON(!cp->page);
-		if (!PageUptodate(cp->page)) {
-			struct bio *sbio = bio_alloc(GFP_NOIO, 1);
-			BUG_ON(!sbio);
-			bio_add_page(sbio, cp->page, PAGE_SIZE, 0);
-			bio_set_dev(sbio, dm_dev[0]->bdev);
-			bio_set_op_attrs(sbio, REQ_OP_READ, 0);
-			sbio->bi_iter.bi_sector =
-				((i << PAGE_SHIFT) + left) >> SECTOR_SHIFT;
-			sbio->bi_iter.bi_size = PAGE_SIZE;
-			sbio->bi_end_io = zfile_readendio;
-			submit_bio(sbio);
-		} else {
-			unlock_page(cp->page);
-		}
-	}
-
-	zfile_readahead(mapping, right, 64);
-
-	blk_finish_plug(&plug);
-
-	// possable online decompress
-	i = 0;
-	list_for_each_entry (cp, &pagelist, list) {
-		if (!PageUptodate(cp->page)) {
-			miss = 1;
-			break;
-		}
-	}
-
-	if (likely(!miss)) {
-		do_decompress(zf, bio, mapping, &pagelist, left, nr_pages);
-		return DM_MAPIO_SUBMITTED;
-	}
-
-	// missing pages exists, read & decompress in workers
-	cmd = kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
-
-	INIT_WORK(&cmd->work, decompress_fn);
-	cmd->bio = bio;
+	struct fillbio_work *cmd =
+		kmalloc(sizeof(struct fillbio_work), GFP_NOIO);
+	INIT_WORK(&cmd->work, fillbio_fn);
 	cmd->zf = zf;
-	cmd->mapping = mapping;
-	list_move_all(&pagelist, &cmd->pagelist);
-
+	cmd->bio = bio;
+	cmd->dev = dm_dev[0];
 	queue_work(zf->wq, &cmd->work);
 
 	return DM_MAPIO_SUBMITTED;
