@@ -3,7 +3,7 @@ CONFIG_MODULE_SIG=n
 MYPROC=vbd
 obj-m += vbd.o
 
-ccflags-y := -std=gnu11 -Wno-declaration-after-statement -O3
+ccflags-y := -std=gnu11 -Wno-declaration-after-statement -O3 -DZFILE_CLEANUP_CACHE -DZFILE_READAHEAD -DZFILE_DECOMPRESS_SHORTCUT
 
 vbd-y := dm-ovbd.o dm-lsmt.o dm-zfile.o lsmt.o zfile.o vfsfile.o blkfile.o
 
