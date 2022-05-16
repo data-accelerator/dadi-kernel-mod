@@ -53,7 +53,8 @@ static int zfile_target_map(struct dm_target *ti, struct bio *bio)
 		return mdt->zfile->op->bio_remap((struct vfile *)mdt->zfile,
 						 bio, &mdt->dev, 1);
 	}
-	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);
+	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+	       bio_op(bio), bio->bi_status);
 	return DM_MAPIO_KILL;
 }
 
@@ -62,7 +63,8 @@ static int zfile_target_end_io(struct dm_target *ti, struct bio *bio,
 {
 	// struct zfile_dm_target *mdt = (struct zfile_dm_target *)ti->private;
 	if (bio->bi_status != BLK_STS_OK) {
-		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);	
+		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		       bio_op(bio), bio->bi_status);
 		return DM_ENDIO_REQUEUE;
 	}
 	return DM_ENDIO_DONE;

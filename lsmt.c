@@ -1,12 +1,4 @@
-#include <asm/segment.h>
-#include <linux/bio.h>
 #include <linux/device-mapper.h>
-#include <linux/fs.h>
-//#include <asm/uaccess.h>
-#include <linux/buffer_head.h>
-#include <linux/lz4.h>
-#include <linux/slab.h>
-#include <linux/string.h>
 #include <linux/vmalloc.h>
 #include "lsmt.h"
 #include "zfile.h"

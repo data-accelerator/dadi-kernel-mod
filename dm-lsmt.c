@@ -10,12 +10,12 @@
 #include "lsmt.h"
 #include "blkfile.h"
 
-	/* This is a structure stores information about the underlying device
+/* This is a structure stores information about the underlying device
  * Param:
  *  dev : Underlying device
  *  start: Starting sector number of the device
  */
-	struct lsmt_dm_target {
+struct lsmt_dm_target {
 	struct dm_dev *dev[256];
 	IFile *lsmt;
 	IFile *bf[256];
@@ -60,7 +60,8 @@ static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 		return mdt->lsmt->op->bio_remap((struct vfile *)mdt->lsmt, bio,
 						mdt->dev, mdt->nr);
 	}
-	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);
+	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+	       bio_op(bio), bio->bi_status);
 	return DM_MAPIO_KILL;
 }
 
@@ -70,7 +71,8 @@ static int lsmt_target_end_io(struct dm_target *ti, struct bio *bio,
 	//     struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
 	// pr_info("lsmt bio status = %d\n", bio->bi_status);
 	if (bio->bi_status != BLK_STS_OK) {
-		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__, bio_op(bio), bio->bi_status);	
+		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		       bio_op(bio), bio->bi_status);
 		return DM_ENDIO_REQUEUE;
 	}
 	return DM_ENDIO_DONE;

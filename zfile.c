@@ -1,20 +1,8 @@
 #include "zfile.h"
 
-#include <linux/buffer_head.h>
-#include <linux/errno.h>
-#include <linux/kallsyms.h>
 #include <linux/lz4.h>
-#include <linux/mm.h>
-#include <linux/mman.h>
 #include <linux/vmalloc.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/uio.h>
-#include <linux/vmalloc.h>
-#include <linux/blkdev.h>
 #include <linux/device-mapper.h>
-#include <linux/spinlock.h>
-#include <linux/bio.h>
 #include <linux/prefetch.h>
 #include "vfsfile.h"
 #include "log-format.h"
@@ -31,9 +19,6 @@ static const uuid_t MAGIC1 = UUID_INIT(0x74756a69, 0x2e79, 0x7966, 0x40, 0x41,
 #define FLAG_SHIFT_SEALED 2
 // 1:YES,       0:NO  				# skip it now.
 #define FLAG_SHIFT_HEADER_OVERWRITE 3
-
-#define ZFILE_I_BL_FETCHING_BIT (BITS_PER_LONG - 1)
-#define ZFILE_I_BL_DECOMPRESING (BITS_PER_LONG - 2)
 
 uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
 {
@@ -204,6 +189,7 @@ struct compressed_page {
 	struct list_head list;
 	struct page *page;
 	loff_t underlay_offset;
+	bool inline_page;
 };
 
 static void do_decompress(struct zfile *zf, struct bio *bio,
@@ -248,7 +234,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 
 	list_for_each_entry_safe (cp, ncp, pagelist, list) {
 		put_page(cp->page);
-		kfree(cp);
+		mempool_free(cp, &zf->cppool);
 	}
 }
 
@@ -291,7 +277,7 @@ static void decompress_fn(struct work_struct *work)
 	nr = (right - left) >> PAGE_SHIFT;
 
 	list_for_each_entry (cp, &cmd->pagelist, list) {
-		if (PageLocked(cp->page)) {
+		if (!PageUptodate(cp->page)) {
 			wait_on_page_locked(cp->page);
 			if (!PageUptodate(cp->page)) {
 				goto exit;
@@ -304,7 +290,7 @@ static void decompress_fn(struct work_struct *work)
 
 	try_drop_cache(cmd->mapping, begin, range, left, right);
 exit:
-	kfree(cmd);
+	mempool_free(cmd, &cmd->zf->cmdpool);
 }
 
 struct readahead_work {
@@ -338,7 +324,6 @@ static void zfile_readendio(struct bio *bio)
 			SetPageError(page);
 		else
 			SetPageUptodate(page);
-
 		unlock_page(page);
 		/* page could be reclaimed now */
 	}
@@ -356,7 +341,7 @@ static void list_move_all(struct list_head *old, struct list_head *new)
 	new->next = first;
 }
 
-static void zfile_acquire_pages(struct block_device *bdev,
+static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
 				struct address_space *mapping,
 				struct list_head *pagelist, loff_t left,
 				int nr_pages)
@@ -364,7 +349,7 @@ static void zfile_acquire_pages(struct block_device *bdev,
 	int i;
 	struct compressed_page *cp;
 	for (i = 0; i < nr_pages; i++) {
-		cp = kmalloc(sizeof(struct compressed_page), GFP_NOIO);
+		cp = mempool_alloc(&zf->cppool, GFP_NOIO);
 		list_add_tail(&cp->list, pagelist);
 		// lock dance by self, do not acquire page lock except it is a new page
 		cp->page = pagecache_get_page(
@@ -375,8 +360,8 @@ static void zfile_acquire_pages(struct block_device *bdev,
 		if (!PageUptodate(cp->page) && !PageLocked(cp->page)) {
 			if (trylock_page(cp->page)) {
 				if (!PageUptodate(cp->page)) {
-					struct bio *sbio =
-						bio_alloc(GFP_NOIO, 1);
+					struct bio *sbio = bio_alloc_bioset(
+						GFP_NOIO, 1, &zf->bioset);
 					BUG_ON(!sbio);
 					bio_add_page(sbio, cp->page, PAGE_SIZE,
 						     0);
@@ -451,7 +436,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	LIST_HEAD(pagelist);
 
-	zfile_acquire_pages(dm_dev[0]->bdev, mapping, &pagelist, left,
+	zfile_acquire_pages(zf, dm_dev[0]->bdev, mapping, &pagelist, left,
 			    nr_pages);
 
 	zfile_readahead(mapping, right, 64);
@@ -477,7 +462,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 #endif
 
 	// missing pages exists, read & decompress in workers
-	cmd = kmalloc(sizeof(struct decompress_work), GFP_KERNEL);
+	cmd = mempool_alloc(&zf->cmdpool, GFP_NOIO);
 
 	INIT_WORK(&cmd->work, decompress_fn);
 	cmd->bio = bio;
@@ -517,25 +502,25 @@ IFile *zfile_open_by_file(struct vfile *file)
 	zfile->fp = file;
 
 	// should verify header
-	//	if (!is_header_overwrite(&zfile->header)) {
-	file_size = zfile->fp->op->len(zfile->fp);
-	tailer_offset = file_size - ZF_SPACE;
-	PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-		   tailer_offset);
-	ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-				   sizeof(struct zfile_ht), tailer_offset);
-	PRINT_INFO(
-		"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-		"verify=%d",
-		zfile->header.vsize, zfile->header.index_offset,
-		zfile->header.index_size, zfile->header.opt.verify);
-	//	} else {
-	//		PRINT_INFO(
-	//			"zfile header overwrite: size=%lld index_offset=%lld "
-	//			"index_size=%lld verify=%d",
-	//			zfile->header.vsize, zfile->header.index_offset,
-	//			zfile->header.index_size, zfile->header.opt.verify);
-	//	}
+	if (!is_header_overwrite(&zfile->header)) {
+		file_size = zfile->fp->op->len(zfile->fp);
+		tailer_offset = file_size - ZF_SPACE;
+		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
+			tailer_offset);
+		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
+					sizeof(struct zfile_ht), tailer_offset);
+		PRINT_INFO(
+			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+			"verify=%d",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	} else {
+		PRINT_INFO(
+			"zfile header overwrite: size=%lld index_offset=%lld "
+			"index_size=%lld verify=%d",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	}
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
@@ -555,6 +540,22 @@ IFile *zfile_open_by_file(struct vfile *file)
 	vfree(jt_saved);
 
 	zfile->vfile.op = &zfile_ops;
+
+	ret = mempool_init_kmalloc_pool(&zfile->cmdpool, 4096,
+					sizeof(struct decompress_work));
+	if (ret)
+		goto error_out;
+
+	ret = mempool_init_kmalloc_pool(&zfile->cppool, 4096,
+					sizeof(struct compressed_page));
+	if (ret)
+		goto error_out;
+
+	ret = bioset_init(&zfile->bioset, 4096, 0,
+			  BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
+	if (ret)
+		goto error_out;
+
 	zfile->onlinecpus = num_possible_cpus();
 	const unsigned int flags =
 		WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_CPU_INTENSIVE;
@@ -566,8 +567,11 @@ IFile *zfile_open_by_file(struct vfile *file)
 	return (IFile *)zfile;
 
 error_out:
-	if (zfile)
+	if (zfile) {
+		mempool_exit(&zfile->cppool);
+		mempool_exit(&zfile->cmdpool);
 		zfile_close((struct vfile *)zfile);
+	}
 	return NULL;
 }
 
@@ -605,6 +609,9 @@ void zfile_close(struct vfile *f)
 			zfile->jump = NULL;
 		}
 		zfile->fp = NULL;
+		bioset_exit(&zfile->bioset);
+		mempool_exit(&zfile->cppool);
+		mempool_exit(&zfile->cmdpool);
 		kfree(zfile);
 	}
 }

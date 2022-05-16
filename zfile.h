@@ -62,6 +62,9 @@ struct zfile {
 	struct jump_table *jump;
 	struct workqueue_struct *wq;
 	struct address_space *umap;
+	struct bio_set bioset;
+	mempool_t cppool;
+	mempool_t cmdpool;
 	int onlinecpus;
 };
 
