@@ -20,6 +20,13 @@ static const uuid_t MAGIC1 = UUID_INIT(0x74756a69, 0x2e79, 0x7966, 0x40, 0x41,
 // 1:YES,       0:NO  				# skip it now.
 #define FLAG_SHIFT_HEADER_OVERWRITE 3
 
+enum zfile_page_state {
+	ZFILE_PAGE_INPLACE = 0,
+	ZFILE_PAGE_READING = 1,
+	ZFILE_PAGE_UPTODATE = 2,
+	ZFILE_PAGE_ERROR = 3,
+};
+
 uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
 {
 	return ht->flags & (1 << shift);
@@ -188,7 +195,7 @@ struct compressed_page {
 	struct list_head list;
 	struct page *page;
 	loff_t underlay_offset;
-	bool inline_page;
+	unsigned long state;
 };
 
 static void do_decompress(struct zfile *zf, struct bio *bio,
@@ -203,7 +210,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 
 	void *holder = NULL;
 
-	pages = kmalloc_array(sizeof(struct page *), nr, GFP_KERNEL);
+	pages = kmalloc_array(nr, sizeof(struct page *), GFP_KERNEL);
 
 	list_for_each_entry (cp, pagelist, list) {
 		pages[i++] = cp->page;
@@ -225,7 +232,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio,
 		}
 	}
 
-	vm_unmap_aliases();
+	vm_unmap_ram(holder, nr);
 
 	bio_endio(bio);
 
@@ -244,6 +251,30 @@ static void try_drop_cache(struct address_space *mapping, size_t begin,
 				    right >> PAGE_SHIFT, 0);
 	}
 #endif
+}
+
+#define SetCP(cp, Key) set_bit(ZFILE_PAGE_##Key, &(cp)->state)
+#define ClearCP(cp, Key) clear_bit(ZFILE_PAGE_##Key, &(cp)->state)
+#define GetCP(cp, Key) test_bit(ZFILE_PAGE_##Key, &(cp)->state)
+
+static void zfile_unlock_page(struct compressed_page *cp)
+{
+	if (GetCP(cp, INPLACE)) {
+		clear_and_wake_up_bit(ZFILE_PAGE_READING, &cp->state);
+	} else {
+		unlock_page(cp->page);
+	}
+	detach_page_private(cp->page);
+}
+
+static void zfile_wait_on_compressed_page_locked(struct compressed_page *cp)
+{
+	if (GetCP(cp, INPLACE)) {
+		wait_on_bit_io(&cp->state, ZFILE_PAGE_READING,
+			       TASK_UNINTERRUPTIBLE);
+	} else {
+		wait_on_page_locked(cp->page);
+	}
 }
 
 static void decompress_fn(struct work_struct *work)
@@ -271,19 +302,25 @@ static void decompress_fn(struct work_struct *work)
 	nr = (right - left) >> PAGE_SHIFT;
 
 	list_for_each_entry (cp, &cmd->pagelist, list) {
-		wait_on_page_locked(cp->page);
-		if (!PageUptodate(cp->page)) {
-			goto exit;
+		zfile_wait_on_compressed_page_locked(cp);
+		if (GetCP(cp, INPLACE)) {
+			if (!GetCP(cp, UPTODATE)) {
+				goto exit;
+			}
+		} else {
+			if (!PageUptodate(cp->page)) {
+				goto exit;
+			}
 		}
 	}
-
 	do_decompress(cmd->zf, cmd->bio, cmd->mapping, &cmd->pagelist, left,
 		      nr);
 
 	try_drop_cache(cmd->mapping, begin, range, left, right);
 exit:
 	list_for_each_entry_safe (cp, ncp, &cmd->pagelist, list) {
-		put_page(cp->page);
+		if (!GetCP(cp, INPLACE))
+			put_page(cp->page);
 		mempool_free(cp, &cmd->zf->cppool);
 	}
 	mempool_free(cmd, &cmd->zf->cmdpool);
@@ -312,15 +349,27 @@ static void zfile_readendio(struct bio *bio)
 
 	bio_for_each_segment_all (bvec, bio, iter_all) {
 		struct page *page = bvec->bv_page;
+		struct compressed_page *cp =
+			(struct compressed_page *)page_private(page);
 
 		/* page is already locked */
-		BUG_ON(PageUptodate(page));
+		BUG_ON(!page_has_private(page));
 
-		if (err)
-			SetPageError(page);
-		else
-			SetPageUptodate(page);
-		unlock_page(page);
+		if (GetCP(cp, INPLACE)) {
+			BUG_ON(GetCP(cp, UPTODATE));
+			if (err)
+				SetCP(cp, ERROR);
+			else
+				SetCP(cp, UPTODATE);
+		} else {
+			BUG_ON(PageUptodate(page));
+			if (err)
+				SetPageError(page);
+			else
+				SetPageUptodate(page);
+		}
+
+		zfile_unlock_page(cp);
 		/* page could be reclaimed now */
 	}
 	bio_put(bio);
@@ -337,25 +386,73 @@ static void list_move_all(struct list_head *old, struct list_head *new)
 	new->next = first;
 }
 
+static bool zfile_able_to_inplace(struct zfile *zf, loff_t upper_offset,
+				  loff_t read_offset)
+{
+	loff_t idx = (upper_offset) / zf->header.opt.block_size;
+	return ((zf->jump[idx].partial_offset >> PAGE_SHIFT) > (read_offset));
+}
+
 static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
-				struct address_space *mapping,
+				struct address_space *mapping, struct bio *bio,
 				struct list_head *pagelist, loff_t left,
 				int nr_pages)
 {
-	int i;
+	int i, j, bpnr;
 	struct compressed_page *cp;
 	struct blk_plug plug;
+	struct page **biopages;
+	struct bio *cbio;
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	loff_t boff, bleft, bsize, bright, brange;
+
+	boff = bio->bi_iter.bi_sector << SECTOR_SHIFT;
+	bleft = boff & PAGE_MASK;
+	bsize = bio->bi_iter.bi_size;
+	bright = (boff + bsize + PAGE_SIZE - 1) & PAGE_MASK;
+	brange = bright - bleft;
+	biopages = kmalloc_array(brange >> PAGE_SHIFT, sizeof(struct page *),
+				 GFP_NOIO);
+
+	cbio = bio_clone_fast(bio, GFP_NOIO, &zf->bioset);
+	bpnr = 0;
+	bio_for_each_segment (bv, cbio, iter) {
+		biopages[bpnr++] = bv.bv_page;
+	}
+	bio_put(cbio);
 
 	blk_start_plug(&plug);
 
-	for (i = 0; i < nr_pages; i++) {
+	for (i = 0, j = 0; i < nr_pages; i++) {
 		cp = mempool_alloc(&zf->cppool, GFP_NOIO);
 		list_add_tail(&cp->list, pagelist);
-		cp->page = find_or_create_page(
-			mapping, i + (left >> PAGE_SHIFT), GFP_NOIO);
 		cp->underlay_offset = left + (i << PAGE_SHIFT);
+		cp->state = 0;
+		cp->page = find_lock_page(mapping, i + (left >> PAGE_SHIFT));
+		if (cp->page == NULL) {
+			// not in page cache
+			while (j < bpnr) {
+				if (zfile_able_to_inplace(
+					    zf, (j << PAGE_SHIFT) + bleft,
+					    (i << PAGE_SHIFT) + left))
+					break;
+				j++;
+			}
+			if (j < bpnr && !page_has_private(biopages[j])) {
+				SetCP(cp, INPLACE);
+				test_and_set_bit_lock(ZFILE_PAGE_READING,
+						      &cp->state);
+				cp->page = biopages[j];
+			} else {
+				cp->page = find_or_create_page(
+					mapping, i + (left >> PAGE_SHIFT),
+					GFP_NOIO);
+			}
+		}
 		BUG_ON(!cp->page);
-		if (!PageUptodate(cp->page)) {
+		attach_page_private(cp->page, cp);
+		if (GetCP(cp, INPLACE) || !PageUptodate(cp->page)) {
 			struct bio *sbio =
 				bio_alloc_bioset(GFP_NOIO, 1, &zf->bioset);
 			BUG_ON(!sbio);
@@ -367,11 +464,12 @@ static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
 			sbio->bi_end_io = zfile_readendio;
 			submit_bio(sbio);
 		} else {
-			unlock_page(cp->page);
+			zfile_unlock_page(cp);
 		}
 	}
 
 	blk_finish_plug(&plug);
+	kfree(biopages);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -425,7 +523,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	LIST_HEAD(pagelist);
 
-	zfile_acquire_pages(zf, dm_dev[0]->bdev, mapping, &pagelist, left,
+	zfile_acquire_pages(zf, dm_dev[0]->bdev, mapping, bio, &pagelist, left,
 			    nr_pages);
 
 	zfile_readahead(mapping, right, 64);
@@ -493,10 +591,9 @@ IFile *zfile_open_by_file(struct vfile *file)
 		file_size = zfile->fp->op->len(zfile->fp);
 		tailer_offset = file_size - ZF_SPACE;
 		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-			   tailer_offset);
+			tailer_offset);
 		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-					   sizeof(struct zfile_ht),
-					   tailer_offset);
+					sizeof(struct zfile_ht), tailer_offset);
 		PRINT_INFO(
 			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
 			"verify=%d",
