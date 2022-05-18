@@ -259,21 +259,44 @@ static void try_drop_cache(struct address_space *mapping, size_t begin,
 
 static void zfile_unlock_page(struct compressed_page *cp)
 {
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 	if (GetCP(cp, INPLACE)) {
 		clear_and_wake_up_bit(ZFILE_PAGE_READING, &cp->state);
 	} else {
 		unlock_page(cp->page);
 	}
 	detach_page_private(cp->page);
+#else
+	unlock_page(cp->page);
+#endif
 }
 
 static void zfile_wait_on_compressed_page_locked(struct compressed_page *cp)
 {
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 	if (GetCP(cp, INPLACE)) {
 		wait_on_bit_io(&cp->state, ZFILE_PAGE_READING,
 			       TASK_UNINTERRUPTIBLE);
 	} else {
 		wait_on_page_locked(cp->page);
+	}
+#else
+	wait_on_page_locked(cp->page);
+#endif
+}
+
+static void zfile_free_page_list_pages(struct zfile *zf,
+				       struct list_head *pagelist)
+{
+	struct compressed_page *cp, *ncp;
+	list_for_each_entry_safe (cp, ncp, pagelist, list) {
+#ifdef ZFILE_INPLACE_DECOMPRESSION
+		if (!GetCP(cp, INPLACE))
+			put_page(cp->page);
+#else
+		put_page(cp->page);
+#endif
+		mempool_free(cp, &zf->cppool);
 	}
 }
 
@@ -282,7 +305,7 @@ static void decompress_fn(struct work_struct *work)
 	size_t start_idx, end_idx, begin, range, left, right;
 	loff_t offset, count, nr;
 	size_t bs;
-	struct compressed_page *cp, *ncp;
+	struct compressed_page *cp;
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
 	BUG_ON(!work);
@@ -303,6 +326,7 @@ static void decompress_fn(struct work_struct *work)
 
 	list_for_each_entry (cp, &cmd->pagelist, list) {
 		zfile_wait_on_compressed_page_locked(cp);
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 		if (GetCP(cp, INPLACE)) {
 			if (!GetCP(cp, UPTODATE)) {
 				goto exit;
@@ -312,17 +336,18 @@ static void decompress_fn(struct work_struct *work)
 				goto exit;
 			}
 		}
+#else
+		if (!PageUptodate(cp->page)) {
+			goto exit;
+		}
+#endif
 	}
 	do_decompress(cmd->zf, cmd->bio, cmd->mapping, &cmd->pagelist, left,
 		      nr);
 
 	try_drop_cache(cmd->mapping, begin, range, left, right);
 exit:
-	list_for_each_entry_safe (cp, ncp, &cmd->pagelist, list) {
-		if (!GetCP(cp, INPLACE))
-			put_page(cp->page);
-		mempool_free(cp, &cmd->zf->cppool);
-	}
+	zfile_free_page_list_pages(cmd->zf, &cmd->pagelist);
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
 
@@ -349,6 +374,7 @@ static void zfile_readendio(struct bio *bio)
 
 	bio_for_each_segment_all (bvec, bio, iter_all) {
 		struct page *page = bvec->bv_page;
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 		struct compressed_page *cp =
 			(struct compressed_page *)page_private(page);
 
@@ -368,8 +394,17 @@ static void zfile_readendio(struct bio *bio)
 			else
 				SetPageUptodate(page);
 		}
-
 		zfile_unlock_page(cp);
+		unlock_page(page);
+#else
+		BUG_ON(PageUptodate(page));
+		if (err)
+			SetPageError(page);
+		else
+			SetPageUptodate(page);
+		unlock_page(page);
+#endif
+
 		/* page could be reclaimed now */
 	}
 	bio_put(bio);
@@ -385,13 +420,14 @@ static void list_move_all(struct list_head *old, struct list_head *new)
 	new->prev = last;
 	new->next = first;
 }
-
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 static bool zfile_able_to_inplace(struct zfile *zf, loff_t upper_offset,
 				  loff_t read_offset)
 {
 	loff_t idx = (upper_offset) / zf->header.opt.block_size;
 	return ((zf->jump[idx].partial_offset >> PAGE_SHIFT) > (read_offset));
 }
+#endif
 
 static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
 				struct address_space *mapping, struct bio *bio,
@@ -429,6 +465,7 @@ static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
 		list_add_tail(&cp->list, pagelist);
 		cp->underlay_offset = left + (i << PAGE_SHIFT);
 		cp->state = 0;
+#ifdef ZFILE_INPLACE_DECOMPRESSION
 		cp->page = find_lock_page(mapping, i + (left >> PAGE_SHIFT));
 		if (cp->page == NULL) {
 			// not in page cache
@@ -453,6 +490,11 @@ static void zfile_acquire_pages(struct zfile *zf, struct block_device *bdev,
 		BUG_ON(!cp->page);
 		attach_page_private(cp->page, cp);
 		if (GetCP(cp, INPLACE) || !PageUptodate(cp->page)) {
+#else
+		cp->page = find_or_create_page(
+			mapping, i + (left >> PAGE_SHIFT), GFP_NOIO);
+		if (!PageUptodate(cp->page)) {
+#endif
 			struct bio *sbio =
 				bio_alloc_bioset(GFP_NOIO, 1, &zf->bioset);
 			BUG_ON(!sbio);
@@ -541,6 +583,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	if (likely(!miss)) {
 		do_decompress(zf, bio, mapping, &pagelist, left, nr_pages);
+		zfile_free_page_list_pages(zf, &pagelist);
 		try_drop_cache(mapping, begin, range, left, right);
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -591,9 +634,10 @@ IFile *zfile_open_by_file(struct vfile *file)
 		file_size = zfile->fp->op->len(zfile->fp);
 		tailer_offset = file_size - ZF_SPACE;
 		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-			tailer_offset);
+			   tailer_offset);
 		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-					sizeof(struct zfile_ht), tailer_offset);
+					   sizeof(struct zfile_ht),
+					   tailer_offset);
 		PRINT_INFO(
 			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
 			"verify=%d",
