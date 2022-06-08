@@ -346,9 +346,9 @@ static void decompress_fn(struct work_struct *work)
 	do_decompress(cmd->zf, cmd->bio, cmd->mapping, &cmd->pagelist, left,
 		      nr);
 
-	try_drop_cache(cmd->mapping, begin, range, left, right);
 exit:
 	zfile_free_page_list_pages(cmd->zf, &cmd->pagelist);
+	try_drop_cache(cmd->mapping, begin, range, left, right);
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
 
