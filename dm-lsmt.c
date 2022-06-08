@@ -111,7 +111,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
-	for (i = 0; *args.argv; i++) {
+	for (i = 0; args.argc >= 2; i++) {
 		devname = dm_shift_arg(&args);
 		tail = dm_shift_arg(&args);
 		ret = kstrtoul(tail, 10, &len);

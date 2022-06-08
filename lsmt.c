@@ -1,5 +1,4 @@
 #include <linux/device-mapper.h>
-#include <linux/vmalloc.h>
 #include "lsmt.h"
 #include "zfile.h"
 #include "log-format.h"
@@ -406,9 +405,8 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 			PRINT_INFO("realloc array. ( %lu -> %lu )", *capacity,
 				   tmp);
 			struct segment_mapping *m =
-				(struct segment_mapping *)kmalloc(
-					tmp * sizeof(struct segment_mapping),
-					GFP_KERNEL);
+				(struct segment_mapping *)vmalloc(
+					tmp * sizeof(struct segment_mapping));
 			if (m == NULL) {
 				PRINT_ERROR("realloc failed.");
 				return -1;
@@ -441,8 +439,8 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	size_t capacity = ro_index_size(indexes[0]);
 	PRINT_DEBUG("init capacity: %lu\n", capacity);
 	struct lsmt_ro_index *ret = NULL;
-	struct segment_mapping *mappings = (struct segment_mapping *)kmalloc(
-		sizeof(struct segment_mapping) * capacity, GFP_KERNEL);
+	struct segment_mapping *mappings = (struct segment_mapping *)vmalloc(
+		sizeof(struct segment_mapping) * capacity);
 	if (!mappings) {
 		pr_err("Failed to alloc mapping memory\n");
 		goto err_ret;
@@ -451,25 +449,26 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	merge_indexes(0, indexes, n, &mappings, &size, &capacity, 0,
 		      UINT64_MAX);
 	PRINT_INFO("merge done, index size: %lu", size);
-	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index),
-					      GFP_KERNEL);
-	struct segment_mapping *tmp = (struct segment_mapping *)kmalloc(
-		size * sizeof(struct segment_mapping), GFP_KERNEL);
+	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index), 
+			GFP_KERNEL);
+	struct segment_mapping *tmp = (struct segment_mapping *)vmalloc(
+		size * sizeof(struct segment_mapping));
 	memcpy(tmp, mappings, size * sizeof(struct segment_mapping));
 	if (!tmp || !ret)
 		goto err_ret;
 	ret->pbegin = tmp;
 	ret->pend = tmp + size;
+	ret->mapping = tmp;
 	PRINT_INFO("ret index done. size: %lu", size);
 	return ret;
 
 err_ret:
 	if (mappings)
-		kfree(mappings);
+		vfree(mappings);
 	if (ret)
 		kfree(ret);
 	if (tmp)
-		kfree(tmp);
+		vfree(tmp);
 	return NULL;
 }
 
@@ -541,7 +540,7 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			ht->index_size * sizeof(struct segment_mapping);
 		if (index_bytes == 0 || index_bytes > 1024UL * 1024 * 1024)
 			goto error_ret;
-		struct segment_mapping *p = vmalloc(index_bytes);
+		struct segment_mapping *p = kmalloc(index_bytes, GFP_KERNEL);
 		if (do_load_index(files[i], p, ht) == -1) {
 			vfree(p);
 			PRINT_ERROR("failed to load index from %d-th file", i);
@@ -554,11 +553,11 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			PRINT_ERROR(
 				"failed to create memory index! ( %d-th file )",
 				i);
-			vfree(p);
+			kfree(p);
 			goto error_ret;
 		}
 		indexes[i] = pi;
-		vfree(p);
+		kfree(p);
 	}
 	PRINT_INFO("reverse index.");
 	REVERSE_LIST(IFile *, &files[0], &files[n - 1]);

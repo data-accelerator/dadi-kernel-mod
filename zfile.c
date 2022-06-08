@@ -1,5 +1,6 @@
 #include "zfile.h"
 
+#include <linux/version.h>
 #include <linux/lz4.h>
 #include <linux/vmalloc.h>
 #include <linux/device-mapper.h>
@@ -361,8 +362,13 @@ struct readahead_work {
 void zfile_readahead(struct address_space *mapping, loff_t left, int nr)
 {
 #ifdef ZFILE_READAHEAD
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 	page_cache_readahead_unbounded(mapping, NULL, left >> PAGE_SHIFT, nr,
 				       0);
+#else
+	DEFINE_READAHEAD(ractl, NULL, mapping, left >> PAGE_SHIFT);
+	page_cache_ra_unbounded(&ractl, nr, 0);
+#endif
 #endif
 }
 
@@ -630,26 +636,25 @@ IFile *zfile_open_by_file(struct vfile *file)
 	zfile->fp = file;
 
 	// should verify header
-	if (!is_header_overwrite(&zfile->header)) {
-		file_size = zfile->fp->op->len(zfile->fp);
-		tailer_offset = file_size - ZF_SPACE;
-		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-			   tailer_offset);
-		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-					   sizeof(struct zfile_ht),
-					   tailer_offset);
-		PRINT_INFO(
-			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-			"verify=%d",
-			zfile->header.vsize, zfile->header.index_offset,
-			zfile->header.index_size, zfile->header.opt.verify);
-	} else {
-		PRINT_INFO(
-			"zfile header overwrite: size=%lld index_offset=%lld "
-			"index_size=%lld verify=%d",
-			zfile->header.vsize, zfile->header.index_offset,
-			zfile->header.index_size, zfile->header.opt.verify);
-	}
+	// if (!is_header_overwrite(&zfile->header)) {
+	file_size = zfile->fp->op->len(zfile->fp);
+	tailer_offset = file_size - ZF_SPACE;
+	PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
+		   tailer_offset);
+	ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
+				   sizeof(struct zfile_ht), tailer_offset);
+	PRINT_INFO(
+		"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+		"verify=%d",
+		zfile->header.vsize, zfile->header.index_offset,
+		zfile->header.index_size, zfile->header.opt.verify);
+	// } else {
+	// 	PRINT_INFO(
+	// 		"zfile header overwrite: size=%lld index_offset=%lld "
+	// 		"index_size=%lld verify=%d",
+	// 		zfile->header.vsize, zfile->header.index_offset,
+	// 		zfile->header.index_size, zfile->header.opt.verify);
+	// }
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,

@@ -1,7 +1,6 @@
 #ifndef __ZFILE_RO_H__
 #define __ZFILE_RO_H__
 
-#include <linux/blk-mq.h>
 #include <linux/kthread.h>
 #include <linux/uuid.h>
 #include <linux/xarray.h>
