@@ -11,7 +11,6 @@
 #ifdef OVBD_DEBUG
 
 #define PRINT_DEBUG(fmt, ...)                                                  \
-	if (debug)                                                             \
 	pr_info("\033[33m|DEBUG |\033[0m%s:%d|%s: " fmt "\n", __FILE__,        \
 		__LINE__, __FUNCTION__, ##__VA_ARGS__)
 

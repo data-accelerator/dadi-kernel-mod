@@ -207,7 +207,7 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 					subbio = bio_split(
 						bio, m[i].offset - s.offset,
 						GFP_NOIO, NULL);
-					// bio_chain(subbio, bio);
+					bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
 					s.length -= m[i].offset - s.offset;
@@ -540,7 +540,7 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			ht->index_size * sizeof(struct segment_mapping);
 		if (index_bytes == 0 || index_bytes > 1024UL * 1024 * 1024)
 			goto error_ret;
-		struct segment_mapping *p = kmalloc(index_bytes, GFP_KERNEL);
+		struct segment_mapping *p = vmalloc(index_bytes);
 		if (do_load_index(files[i], p, ht) == -1) {
 			vfree(p);
 			PRINT_ERROR("failed to load index from %d-th file", i);
@@ -553,11 +553,11 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			PRINT_ERROR(
 				"failed to create memory index! ( %d-th file )",
 				i);
-			kfree(p);
+			vfree(p);
 			goto error_ret;
 		}
 		indexes[i] = pi;
-		kfree(p);
+		vfree(p);
 	}
 	PRINT_INFO("reverse index.");
 	REVERSE_LIST(IFile *, &files[0], &files[n - 1]);

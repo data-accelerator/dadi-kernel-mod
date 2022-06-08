@@ -636,25 +636,26 @@ IFile *zfile_open_by_file(struct vfile *file)
 	zfile->fp = file;
 
 	// should verify header
-	// if (!is_header_overwrite(&zfile->header)) {
-	file_size = zfile->fp->op->len(zfile->fp);
-	tailer_offset = file_size - ZF_SPACE;
-	PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
-		   tailer_offset);
-	ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
-				   sizeof(struct zfile_ht), tailer_offset);
-	PRINT_INFO(
-		"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-		"verify=%d",
-		zfile->header.vsize, zfile->header.index_offset,
-		zfile->header.index_size, zfile->header.opt.verify);
-	// } else {
-	// 	PRINT_INFO(
-	// 		"zfile header overwrite: size=%lld index_offset=%lld "
-	// 		"index_size=%lld verify=%d",
-	// 		zfile->header.vsize, zfile->header.index_offset,
-	// 		zfile->header.index_size, zfile->header.opt.verify);
-	// }
+	if (!is_header_overwrite(&zfile->header)) {
+		file_size = zfile->fp->op->len(zfile->fp);
+		tailer_offset = file_size - ZF_SPACE;
+		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
+			   tailer_offset);
+		ret = zfile->fp->op->pread(zfile->fp, &zfile->header,
+					   sizeof(struct zfile_ht),
+					   tailer_offset);
+		PRINT_INFO(
+			"zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
+			"verify=%d",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	} else {
+		PRINT_INFO(
+			"zfile header overwrite: size=%lld index_offset=%lld "
+			"index_size=%lld verify=%d",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	}
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
