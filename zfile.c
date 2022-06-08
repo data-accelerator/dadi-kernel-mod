@@ -248,8 +248,8 @@ static void try_drop_cache(struct address_space *mapping, size_t begin,
 		right += PAGE_SHIFT;
 	}
 	if (right > left) {
-		unmap_mapping_range(mapping, left >> PAGE_SHIFT,
-				    right >> PAGE_SHIFT, 0);
+		invalidate_mapping_pages(mapping, left >> PAGE_SHIFT,
+					 right >> PAGE_SHIFT);
 	}
 #endif
 }
