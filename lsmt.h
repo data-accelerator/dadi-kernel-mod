@@ -51,9 +51,6 @@ struct lsmt_ro_file {
 	IFile *fp[0];
 };
 
-// // lsmt_ro_file functions...
-// // in `lsmt_ro_file`, all data read by using `zfile_read`
-// IFile *lsmt_open_ro(IFile *zf, bool ownership);
 
 // TODO: load multiple layer index
 // lsmt_ro_file merge

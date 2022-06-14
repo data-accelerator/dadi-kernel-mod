@@ -134,7 +134,7 @@ static int zfile_target_ctr(struct dm_target *ti, unsigned int argc,
 
 	mdt->bf = (struct vfile *)open_blkdev_as_vfile(mdt->dev->bdev, zflen);
 
-	mdt->zfile = zfile_open_by_file((struct vfile *)mdt->bf);
+	mdt->zfile = zfile_open_by_file(mdt->bf, mdt->dev->bdev);
 
 	if (!mdt->zfile) {
 		pr_crit("Failed to open zfile file");

@@ -3,7 +3,7 @@
 
 #include <linux/kthread.h>
 #include <linux/uuid.h>
-#include <linux/xarray.h>
+#include <linux/dm-bufio.h>
 
 #include "vfile.h"
 
@@ -62,20 +62,15 @@ struct zfile {
 	struct workqueue_struct *wq;
 	struct address_space *umap;
 	struct bio_set bioset;
-	mempool_t cppool;
 	mempool_t cmdpool;
 	int onlinecpus;
+	struct dm_bufio_client* c;
 };
 
 // zfile functions
 // in `zfile`, data ready by `kernel_read` and then decompress to buffer
-// since calling `zfile_read` may not be aligned query, may have to perform
-// more-than-one page fetch, here is the place to caching non-complete used
-// compressed pages.
-//
-IFile *zfile_open(const char *path);
 
-IFile *zfile_open_by_file(struct vfile *file);
+IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev);
 
 bool is_zfile(struct vfile *file, struct zfile_ht *ht);
 
