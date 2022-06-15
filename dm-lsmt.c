@@ -10,38 +10,12 @@
 #include "lsmt.h"
 #include "blkfile.h"
 
-/* This is a structure stores information about the underlying device
- * Param:
- *  dev : Underlying device
- *  start: Starting sector number of the device
- */
 struct lsmt_dm_target {
 	struct dm_dev *dev[256];
 	IFile *lsmt;
 	IFile *bf[256];
 	unsigned int nr;
 };
-
-/* This is map function of basic target. This function gets called whenever you
- * get a new bio request.The working of map function is to map a particular bio
- * request to the underlying device. The request that we receive is submitted to
- * out device so  bio->bi_bdev points to our device. We should point to the
- * bio-> bi_dev field to bdev of underlying device. Here in this function, we
- * can have other processing like changing sector number of bio request,
- * splitting bio etc.
- *
- * Param :
- *  ti : It is the dm_target structure representing our basic target
- *  bio : The block I/O request from upper layer
- *  map_context : Its mapping context of target.
- *
- * Return values from target map function:
- *  DM_MAPIO_SUBMITTED :  Your target has submitted the bio request to
- * underlying request. DM_MAPIO_REMAPPED  :  Bio request is remapped, Device
- * mapper should submit bio. DM_MAPIO_REQUEUE   :  Some problem has happened
- * with the mapping of bio, So requeue the bio request. So the bio will be
- * submitted to the map function.
- */
 
 static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 {
@@ -68,8 +42,6 @@ static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 static int lsmt_target_end_io(struct dm_target *ti, struct bio *bio,
 			      blk_status_t *error)
 {
-	//     struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
-	// pr_info("lsmt bio status = %d\n", bio->bi_status);
 	if (bio->bi_status != BLK_STS_OK) {
 		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
@@ -78,13 +50,6 @@ static int lsmt_target_end_io(struct dm_target *ti, struct bio *bio,
 	return DM_ENDIO_DONE;
 }
 
-/* This is Constructor Function of basic target
- *  Constructor gets called when we create some device of type 'lsmt_target'.
- *  So it will get called when we execute command 'dmsetup create'
- *  This  function gets called for each device over which you want to create
- * basic target. Here it is just a basic target so it will take only one device
- * so it will get called once.
- */
 static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct lsmt_dm_target *mdt;
@@ -168,11 +133,6 @@ bad:
 	return -EINVAL;
 }
 
-/*
- * This is destruction function
- * This gets called when we remove a device of type basic target. The function
- * gets called per device.
- */
 static void lsmt_target_dtr(struct dm_target *ti)
 {
 	struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
@@ -189,9 +149,6 @@ static void lsmt_target_dtr(struct dm_target *ti)
 	printk(KERN_CRIT "\n>>out function lsmt_target_dtr \n");
 }
 
-/*
- * This structure is fops for basic target.
- */
 static struct target_type lsmt_target = {
 	.features = 0,
 	.name = "lsmt_target",
@@ -202,9 +159,6 @@ static struct target_type lsmt_target = {
 	.map = lsmt_target_map,
 	.end_io = lsmt_target_end_io,
 };
-
-/*-------------------------------------------Module Functions
- * ---------------------------------*/
 
 int init_lsmt_target(void)
 {

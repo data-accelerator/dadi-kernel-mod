@@ -84,7 +84,7 @@ IFile *open_file_as_vfile(struct file *file)
 	ret = kmalloc(sizeof(struct vfs_vfile), GFP_KERNEL);
 	ret->file = file;
 	ret->vfile.op = &ffile_ops;
-	return (IFile*)ret;
+	return (IFile *)ret;
 }
 
 IFile *open_path_as_vfile(const char *fn, int flags, mode_t mode)

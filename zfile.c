@@ -28,32 +28,31 @@ enum zfile_page_state {
 	ZFILE_PAGE_ERROR = 3,
 };
 
-uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
+static size_t zfile_len(IFile *fp);
+static void zfile_close(IFile *ctx);
+static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
+			  unsigned nr);
+
+static struct vfile_op zfile_ops = { .len = zfile_len,
+				     .bio_remap = zfile_bioremap,
+				     .close = zfile_close };
+
+static uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
 {
 	return ht->flags & (1 << shift);
 }
 
-bool is_header(struct zfile_ht *ht)
-{
-	return get_flag_bit(ht, FLAG_SHIFT_HEADER);
-}
-
-bool is_header_overwrite(struct zfile_ht *ht)
+static bool is_header_overwrite(struct zfile_ht *ht)
 {
 	return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
 }
 
-bool is_trailer(struct zfile_ht *ht)
-{
-	return !is_header(ht);
-}
-
-size_t zfile_len(struct vfile *zfile)
+static size_t zfile_len(struct vfile *zfile)
 {
 	return ((struct zfile *)zfile)->header.vsize;
 }
 
-void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
+static void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 {
 	size_t i;
 	zf->jump = vmalloc((zf->header.index_size + 2) *
@@ -232,10 +231,6 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	return DM_MAPIO_SUBMITTED;
 }
 
-static struct vfile_op zfile_ops = { .len = zfile_len,
-				     .bio_remap = zfile_bioremap,
-				     .close = zfile_close };
-
 IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 {
 	uint32_t *jt_saved;
@@ -257,7 +252,7 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	zfile->fp = file;
 
 	// should verify header
-	// if (!is_header_overwrite(&zfile->header)) {
+	if (!is_header_overwrite(&zfile->header)) {
 		file_size = zfile->fp->op->len(zfile->fp);
 		tailer_offset = file_size - ZF_SPACE;
 		PRINT_INFO("zfile: file_size=%lu tail_offset=%llu\n", file_size,
@@ -270,13 +265,13 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 			"verify=%d",
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
-	// } else {
-	// 	PRINT_INFO(
-	// 		"zfile header overwrite: size=%lld index_offset=%lld "
-	// 		"index_size=%lld verify=%d",
-	// 		zfile->header.vsize, zfile->header.index_offset,
-	// 		zfile->header.index_size, zfile->header.opt.verify);
-	// }
+	} else {
+		PRINT_INFO(
+			"zfile header overwrite: size=%lld index_offset=%lld "
+			"index_size=%lld verify=%d",
+			zfile->header.vsize, zfile->header.index_offset,
+			zfile->header.index_size, zfile->header.opt.verify);
+	}
 
 	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
 	PRINT_INFO("get index_size %lu, index_offset %llu", jt_size,
@@ -328,7 +323,7 @@ error_out:
 	return NULL;
 }
 
-void zfile_close(struct vfile *f)
+static void zfile_close(struct vfile *f)
 {
 	struct zfile *zfile = (struct zfile *)f;
 

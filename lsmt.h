@@ -51,14 +51,10 @@ struct lsmt_ro_file {
 	IFile *fp[0];
 };
 
-
-// TODO: load multiple layer index
 // lsmt_ro_file merge
 // open multiple files and merge as one lsmt file output
 IFile *lsmt_open_files(IFile *zf[], int n);
 
-// TODO: lsmt_open_rw support
-// struct lsmt_ro_file* lsmt_open_rw(struct zfile* zf, int n, struct file* wfile);
 bool is_lsmtfile(struct vfile *zf);
 
 #endif

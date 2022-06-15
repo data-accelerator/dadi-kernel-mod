@@ -31,14 +31,13 @@ static uint64_t *MAGIC0 = (uint64_t *)"LSMT\0\1\2";
 static const uuid_t MAGIC1 = UUID_INIT(0x657e63d2, 0x9444, 0x084c, 0xa2, 0xd2,
 				       0xc8, 0xec, 0x4f, 0xcf, 0xae, 0x8a);
 
-size_t lsmt_len(IFile *fp);
-ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset);
-void lsmt_close(IFile *ctx);
-int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
-		  unsigned nr);
+static size_t lsmt_len(IFile *fp);
+static void lsmt_close(IFile *ctx);
+static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
+			 unsigned nr);
 
 static struct vfile_op lsmt_ops = { .len = lsmt_len,
-				    .pread = lsmt_read,
+				    .pread = NULL,
 				    .pread_async = NULL,
 				    .close = lsmt_close,
 				    .bio_remap = lsmt_bioremap };
@@ -48,7 +47,7 @@ static uint64_t segment_end(const void *s)
 	return ((struct segment *)s)->offset + ((struct segment *)s)->length;
 }
 
-void forward_offset_to(void *m, uint64_t x, int8_t type)
+static void forward_offset_to(void *m, uint64_t x, int8_t type)
 {
 	struct segment *s = (struct segment *)m;
 	uint64_t delta = x - s->offset;
@@ -62,7 +61,7 @@ void forward_offset_to(void *m, uint64_t x, int8_t type)
 	}
 }
 
-void backward_end_to(void *m, uint64_t x)
+static void backward_end_to(void *m, uint64_t x)
 {
 	struct segment *s = (struct segment *)m;
 	s->length = x - s->offset;
@@ -79,7 +78,7 @@ static void trim_edge(void *m, const struct segment *bound_segment,
 	}
 }
 
-const struct segment_mapping *
+static const struct segment_mapping *
 ro_index_lower_bound(const struct lsmt_ro_index *index, uint64_t offset)
 {
 	const struct segment_mapping *l = index->pbegin;
@@ -104,9 +103,9 @@ ro_index_lower_bound(const struct lsmt_ro_index *index, uint64_t offset)
 	}
 }
 
-int ro_index_lookup(const struct lsmt_ro_index *index,
-		    const struct segment *query_segment,
-		    struct segment_mapping *ret_mappings, size_t n)
+static int ro_index_lookup(const struct lsmt_ro_index *index,
+			   const struct segment *query_segment,
+			   struct segment_mapping *ret_mappings, size_t n)
 {
 	if (query_segment->length == 0)
 		return 0;
@@ -130,12 +129,12 @@ int ro_index_lookup(const struct lsmt_ro_index *index,
 	return cnt;
 }
 
-size_t ro_index_size(const struct lsmt_ro_index *index)
+static size_t ro_index_size(const struct lsmt_ro_index *index)
 {
 	return index->pend - index->pbegin;
 }
 
-struct lsmt_ro_index *
+static struct lsmt_ro_index *
 create_memory_index(const struct segment_mapping *pmappings, size_t n,
 		    uint64_t moffset_begin, uint64_t moffset_end, bool copy)
 {
@@ -163,12 +162,8 @@ create_memory_index(const struct segment_mapping *pmappings, size_t n,
 	return ret;
 };
 
-static bool is_aligned(uint64_t val)
-{
-	return 0 == (val & 0x1FFUL);
-}
-
-int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
+static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
+			 unsigned nr)
 {
 	struct lsmt_ro_file *fp = (struct lsmt_ro_file *)ctx;
 	struct segment s;
@@ -261,82 +256,9 @@ int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev, unsigned nr)
 	return DM_MAPIO_SUBMITTED;
 }
 
-size_t lsmt_len(IFile *fp)
+static size_t lsmt_len(IFile *fp)
 {
 	return ((struct lsmt_ro_file *)fp)->ht.virtual_size;
-}
-
-ssize_t lsmt_read(IFile *ctx, void *buf, size_t count, loff_t offset)
-{
-	struct lsmt_ro_file *lsmt_file = (struct lsmt_ro_file *)ctx;
-	struct segment s;
-	struct segment_mapping *m;
-	ssize_t ret = 0;
-	size_t i = 0;
-	if (!is_aligned(offset | count)) {
-		PRINT_ERROR("LSMT: %lld %lu not aligned\n", offset, count);
-		return -EINVAL;
-	}
-	if (offset > lsmt_file->ht.virtual_size) {
-		PRINT_INFO("LSMT: %lld over tail\n", offset);
-		return 0;
-	}
-	if (offset + count > lsmt_file->ht.virtual_size) {
-		PRINT_INFO("LSMT: %lld %lu over tail\n", offset, count);
-		count = lsmt_file->ht.virtual_size - offset;
-	}
-	m = kmalloc(16 * sizeof(struct segment_mapping), GFP_KERNEL);
-	s.offset = offset / SECTOR_SIZE;
-	s.length = count / SECTOR_SIZE;
-	while (true) {
-		int n = ro_index_lookup(lsmt_file->index, &s, m, 16);
-		for (i = 0; i < n; ++i) {
-			if (s.offset < m[i].offset) {
-				// hole
-				memset(buf, 0,
-				       (m->offset - s.offset) * SECTOR_SIZE);
-				offset +=
-					(m[i].offset - s.offset) * SECTOR_SIZE;
-				buf += (m[i].offset - s.offset) * SECTOR_SIZE;
-				ret += (m[i].offset - s.offset) * SECTOR_SIZE;
-			}
-			// zeroe block
-			if (m[i].zeroed) {
-				memset(buf, 0, m->length * SECTOR_SIZE);
-				offset += m[i].length * SECTOR_SIZE;
-				buf += m[i].length * SECTOR_SIZE;
-				ret += m[i].length * SECTOR_SIZE;
-			} else {
-				int layer_id = m[i].tag;
-				ssize_t dc = lsmt_file->fp[layer_id]->op->pread(
-					lsmt_file->fp[layer_id], buf,
-					m[i].length * SECTOR_SIZE,
-					m[i].moffset * SECTOR_SIZE);
-				if (dc <= 0) {
-					PRINT_INFO(
-						"LSMT: read failed ret=%ld\n",
-						dc);
-					goto out;
-				}
-				offset += m[i].length * SECTOR_SIZE;
-				buf += m[i].length * SECTOR_SIZE;
-				ret += m[i].length * SECTOR_SIZE;
-			}
-			forward_offset_to(&s, segment_end(&(m[i])),
-					  TYPE_SEGMENT);
-		}
-		if (n < 16)
-			break;
-	}
-	if (s.length > 0) {
-		memset(buf, 0, s.length * SECTOR_SIZE);
-		offset += s.length * SECTOR_SIZE;
-		ret += s.length * SECTOR_SIZE;
-		buf += s.length * SECTOR_SIZE;
-	}
-out:
-	kfree(m);
-	return ret;
 }
 
 bool is_lsmtfile(IFile *fp)
@@ -357,7 +279,7 @@ bool is_lsmtfile(IFile *fp)
 	return ht.magic0 == *MAGIC0 && uuid_equal(&ht.magic1, &MAGIC1);
 }
 
-void lsmt_close(IFile *ctx)
+static void lsmt_close(IFile *ctx)
 {
 	struct lsmt_ro_file *lsmt_file = (struct lsmt_ro_file *)ctx;
 	if (lsmt_file->ownership) {
@@ -449,8 +371,8 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	merge_indexes(0, indexes, n, &mappings, &size, &capacity, 0,
 		      UINT64_MAX);
 	PRINT_INFO("merge done, index size: %lu", size);
-	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index), 
-			GFP_KERNEL);
+	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index),
+					      GFP_KERNEL);
 	struct segment_mapping *tmp = (struct segment_mapping *)vmalloc(
 		size * sizeof(struct segment_mapping));
 	memcpy(tmp, mappings, size * sizeof(struct segment_mapping));
