@@ -57,11 +57,8 @@ struct zfile {
 	bool onwership;
 	struct zfile_ht header;
 	struct jump_table *jump;
-	struct workqueue_struct *wq;
-	struct address_space *umap;
 	struct bio_set bioset;
 	mempool_t cmdpool;
-	int onlinecpus;
 	struct dm_bufio_client *c;
 };
 

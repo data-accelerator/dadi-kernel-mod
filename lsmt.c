@@ -172,7 +172,7 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 	size_t i = 0;
 	loff_t offset = bio->bi_iter.bi_sector;
 	if (bio_op(bio) != REQ_OP_READ) {
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
@@ -180,7 +180,7 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 	if ((offset << SECTOR_SHIFT) > fp->ht.virtual_size) {
 		PRINT_INFO("LSMT: %lld over tail %lld\n", offset,
 			   fp->ht.virtual_size);
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
@@ -364,7 +364,7 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	struct segment_mapping *mappings = (struct segment_mapping *)vmalloc(
 		sizeof(struct segment_mapping) * capacity);
 	if (!mappings) {
-		pr_err("Failed to alloc mapping memory\n");
+		PRINT_ERROR("Failed to alloc mapping memory\n");
 		goto err_ret;
 	}
 	PRINT_DEBUG("start merge indexes, layers: %lu", n);

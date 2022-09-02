@@ -1,53 +1,28 @@
 #include "blkfile.h"
+#include "log-format.h"
+#include <linux/dm-bufio.h>
 
 // special helper
 // access blockdev data by sync
 // copy to buffer
-static ssize_t sync_read_blkdev(struct block_device *dev, void *buf,
+static ssize_t sync_read_blkdev(struct blkdev_as_vfile *f, void *buf,
 				size_t count, loff_t offset)
 {
 	void *mem = NULL;
-	struct page *pg = NULL;
-	struct bio *bio = NULL;
 	loff_t left = offset & PAGE_MASK;
 	loff_t right = (offset + count + PAGE_SIZE - 1) & PAGE_MASK;
 	loff_t i = 0;
 	size_t sg_len = 0;
 	ssize_t ret = 0;
 	int nr_pages = 0;
-	size_t dsize = get_capacity(dev->bd_disk);
-	struct page **pages = NULL;
+	size_t dsize = f->len;
+	struct dm_buffer *dbuf = NULL;
 	if (right > (dsize << SECTOR_SHIFT)) {
 		right = (dsize << SECTOR_SHIFT);
 	}
 
 	nr_pages = (right - left + PAGE_SIZE - 1) / PAGE_SIZE;
-	bio = bio_alloc(GFP_KERNEL, nr_pages);
-	if (IS_ERR(bio)) {
-		ret = -EIO;
-		goto out;
-	}
-	bio_get(bio);
-
-	pages = kmalloc(sizeof(struct page *) * nr_pages, GFP_KERNEL);
-
-	for (i = left; i < right; i += PAGE_SIZE) {
-		pg = alloc_page(GFP_NOIO);
-		BUG_ON(!bio_add_page(
-			bio, pg, right - i > PAGE_SIZE ? PAGE_SIZE : right - i,
-			0));
-		pages[(i - left) / PAGE_SIZE] = pg;
-	}
-	bio_set_dev(bio, dev);
-	bio->bi_iter.bi_sector = left >> SECTOR_SHIFT;
-	bio_set_op_attrs(bio, REQ_OP_READ, 0);
-
-	submit_bio_wait(bio);
-
-	if (bio->bi_status != BLK_STS_OK) {
-		ret = -EIO;
-		goto out;
-	}
+	dm_bufio_prefetch(f->c, left >> PAGE_SHIFT, nr_pages);
 
 	for (i = 0; i < nr_pages; i++) {
 		if (left > offset + count)
@@ -57,27 +32,25 @@ static ssize_t sync_read_blkdev(struct block_device *dev, void *buf,
 			sg_len = offset + count - left;
 		if (offset > left)
 			sg_len = sg_len - (offset - left);
-		mem = kmap_atomic(pages[i]);
+		mem = dm_bufio_read(f->c, left >> PAGE_SHIFT, &dbuf);
+		if (IS_ERR(dbuf))
+			goto out;
 		memcpy(buf, mem + (offset - left), sg_len);
+		dm_bufio_release(dbuf);
 		buf += sg_len;
 		offset += sg_len;
 		left += PAGE_SIZE;
 		ret += sg_len;
 		count -= sg_len;
-		kunmap_atomic(mem);
 	}
 out:
-	if (!IS_ERR(bio)) {
-		bio_free_pages(bio);
-		bio_put(bio);
-	}
 	return ret;
 }
 
 static size_t blkdev_len(struct vfile *ctx)
 {
 	struct blkdev_as_vfile *bf = (struct blkdev_as_vfile *)ctx;
-	pr_info("blkdev_len %lld\n", bf->len);
+	PRINT_INFO("blkdev_len %lld\n", bf->len);
 	return bf->len;
 }
 
@@ -89,8 +62,8 @@ static ssize_t blkdev_pread(struct vfile *ctx, void *buf, size_t count,
 	ret = 0;
 	while (count) {
 		tr = sync_read_blkdev(
-			bf->dev, buf,
-			count > 4 * PAGE_SIZE ? 4 * PAGE_SIZE : count, offset);
+			bf, buf, count > 4 * PAGE_SIZE ? 4 * PAGE_SIZE : count,
+			offset);
 		if (tr < 0) {
 			return tr;
 		}
@@ -107,8 +80,11 @@ static ssize_t blkdev_pread(struct vfile *ctx, void *buf, size_t count,
 
 static void blkdev_close(struct vfile *ctx)
 {
-	if (!ctx)
+	struct blkdev_as_vfile *bf = (struct blkdev_as_vfile *)ctx;
+	if (ctx) {
+		dm_bufio_client_destroy(bf->c);
 		kfree(ctx);
+	}
 	return;
 }
 
@@ -130,10 +106,17 @@ IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
 	if (!ret)
 		return NULL;
 	ret->vfile.op = &blkdev_op;
-	ret->dev = blk;
+	ret->c = dm_bufio_client_create(blk, 4096, 2, 0, NULL, NULL);
+	if (IS_ERR(ret->c)) {
+		goto errout;
+	}
+	// ret->dev = blk;
 	if (len == -1)
 		len = get_capacity(blk->bd_disk) << SECTOR_SHIFT;
 	ret->len = len;
-	// pr_info("open as vfile dev %p\n", ret->dev);
+	// PRINT_INFO("open as vfile dev %p\n", ret->dev);
 	return (IFile *)ret;
+errout:
+	kfree(ret);
+	return NULL;
 }

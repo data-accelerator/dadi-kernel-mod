@@ -9,6 +9,7 @@
 
 #include "lsmt.h"
 #include "blkfile.h"
+#include "log-format.h"
 
 struct lsmt_dm_target {
 	struct dm_dev *dev[256];
@@ -22,19 +23,16 @@ static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 	struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
 
 	if (!mdt) {
-		pr_err("LSMT DM Target not ready!!\n");
+		PRINT_ERROR("LSMT DM Target not ready!!\n");
 		return DM_MAPIO_REQUEUE;
 	}
-	// printk(KERN_CRIT "\n<<in function lsmt_target_map \n");
 
 	switch (bio_op(bio)) {
 	case REQ_OP_READ:
-		// pr_info("sec: %lld vcnt: %d\n", bio->bi_iter.bi_sector,
-		// 	bio->bi_iter.bi_size);
 		return mdt->lsmt->op->bio_remap((struct vfile *)mdt->lsmt, bio,
 						mdt->dev, mdt->nr);
 	}
-	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+	PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 	       bio_op(bio), bio->bi_status);
 	return DM_MAPIO_KILL;
 }
@@ -43,7 +41,7 @@ static int lsmt_target_end_io(struct dm_target *ti, struct bio *bio,
 			      blk_status_t *error)
 {
 	if (bio->bi_status != BLK_STS_OK) {
-		pr_err("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("DONE NOT OK %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_ENDIO_REQUEUE;
 	}
@@ -60,10 +58,10 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret;
 	int i;
 
-	printk(KERN_CRIT "\n >>in function lsmt_target_ctr \n");
+	PRINT_INFO("\n >>in function lsmt_target_ctr \n");
 
 	if (argc < 2) {
-		printk(KERN_CRIT "\n Invalid no.of arguments.\n");
+		PRINT_INFO("\n Invalid no.of arguments.\n");
 		ti->error = "Invalid argument count";
 		return -EINVAL;
 	}
@@ -71,7 +69,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mdt = kmalloc(sizeof(struct lsmt_dm_target), GFP_KERNEL);
 
 	if (mdt == NULL) {
-		printk(KERN_CRIT "\n Mdt is null\n");
+		PRINT_INFO("\n Mdt is null\n");
 		ti->error = "dm-lsmt_target: Cannot allocate context";
 		return -ENOMEM;
 	}
@@ -84,7 +82,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			pr_warn("Invalid parameter");
 			goto error_out;
 		}
-		printk(KERN_INFO "\nlsmt-md: load dev %s\n", devname);
+		PRINT_INFO("\nlsmt-md: load dev %s\n", devname);
 		if (dm_get_device(ti, devname, dm_table_get_mode(ti->table),
 				  &mdt->dev[i])) {
 			ti->error = "dm-lsmt_target: Device lookup failed";
@@ -96,12 +94,11 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			goto error_out;
 		}
 		mdt->bf[i] = open_blkdev_as_vfile(mdt->dev[i]->bdev, len);
-		pr_info("lsmt: file %d size %lu", i,
+		PRINT_INFO("lsmt: file %d size %lu", i,
 			mdt->bf[i]->op->len(mdt->bf[i]));
 	}
 	mdt->nr = i;
 
-	// TODO: load multiple layer index
 	mdt->lsmt = lsmt_open_files(mdt->bf, 1);
 
 	if (!mdt->lsmt) {
@@ -109,12 +106,12 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto error_out;
 	}
 
-	pr_info("dm-lsmt: blk size is %lu\n",
+	PRINT_INFO("dm-lsmt: blk size is %lu\n",
 		mdt->lsmt->op->len((struct vfile *)mdt->lsmt));
 
 	ti->private = mdt;
 
-	printk(KERN_CRIT "\n>>out function lsmt_target_ctr \n");
+	PRINT_INFO("\n>>out function lsmt_target_ctr \n");
 	return 0;
 
 error_out:
@@ -129,7 +126,7 @@ error_out:
 	}
 bad:
 	kfree(mdt);
-	printk(KERN_CRIT "\n>>out function lsmt_target_ctr with error \n");
+	PRINT_INFO("\n>>out function lsmt_target_ctr with error \n");
 	return -EINVAL;
 }
 
@@ -137,16 +134,14 @@ static void lsmt_target_dtr(struct dm_target *ti)
 {
 	struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
 	unsigned int i = 0;
-	printk(KERN_CRIT "\n<<in function lsmt_target_dtr \n");
+	PRINT_INFO("\n<<in function lsmt_target_dtr \n");
 	if (mdt->lsmt)
 		mdt->lsmt->op->close((struct vfile *)mdt->lsmt);
 	for (i = 0; i < mdt->nr; i++) {
-		if (mdt->bf[i])
-			mdt->bf[i]->op->close((struct vfile *)mdt->bf);
 		dm_put_device(ti, mdt->dev[i]);
 	}
 	kfree(mdt);
-	printk(KERN_CRIT "\n>>out function lsmt_target_dtr \n");
+	PRINT_INFO("\n>>out function lsmt_target_dtr \n");
 }
 
 static struct target_type lsmt_target = {
@@ -165,7 +160,7 @@ int init_lsmt_target(void)
 	int result;
 	result = dm_register_target(&lsmt_target);
 	if (result < 0)
-		printk(KERN_CRIT "\n Error in registering target \n");
+		PRINT_INFO("\n Error in registering target \n");
 	return 0;
 }
 

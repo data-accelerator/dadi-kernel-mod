@@ -6,7 +6,8 @@
 struct blkdev_as_vfile {
 	IFile vfile;
 	loff_t len;
-	struct block_device *dev;
+	struct dm_bufio_client *c;
+
 };
 
 IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len);

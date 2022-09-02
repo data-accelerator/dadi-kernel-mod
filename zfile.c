@@ -7,6 +7,7 @@
 #include <linux/prefetch.h>
 #include "vfsfile.h"
 #include "log-format.h"
+#include "dm-ovbd.h"
 
 static const uint32_t ZF_SPACE = 512;
 static uint64_t *MAGIC0 = (uint64_t *)"ZFile\0\1";
@@ -37,14 +38,20 @@ static struct vfile_op zfile_ops = { .len = zfile_len,
 				     .bio_remap = zfile_bioremap,
 				     .close = zfile_close };
 
+#ifdef ZFILE_HEAD_OVERWRITE
 static uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
 {
 	return ht->flags & (1 << shift);
 }
+#endif
 
 static bool is_header_overwrite(struct zfile_ht *ht)
 {
-	return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
+	#ifdef ZFILE_HEAD_OVERWRITE
+		return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
+	#else
+		return false;
+	#endif
 }
 
 static size_t zfile_len(struct vfile *zfile)
@@ -85,11 +92,15 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 
 	if (right - left == PAGE_SIZE) {
 		src = dm_bufio_read(zf->c, left >> PAGE_SHIFT, &buf);
+		BUG_ON(IS_ERR(buf));
+		BUG_ON(IS_ERR(src));
 		src = src + (begin - left);
 	} else {
 		tmp = src = kmalloc(right - left, GFP_NOIO);
 		for (i = left; i < right; i += PAGE_SIZE) {
 			void *d = dm_bufio_read(zf->c, i >> PAGE_SHIFT, &buf);
+			BUG_ON(IS_ERR(buf));
+			BUG_ON(IS_ERR(d));
 			memcpy(tmp + i - left, d, PAGE_SIZE);
 			dm_bufio_release(buf);
 		}
@@ -105,7 +116,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 	kunmap_atomic(dst);
 
 	if (ret < 0) {
-		pr_err("Decompress error\n");
+		PRINT_ERROR("Decompress error\n");
 	}
 
 	if (tmp) {
@@ -136,7 +147,7 @@ static void do_decompress(struct zfile *zf, struct bio *bio, size_t left,
 					   (iter.bi_sector << SECTOR_SHIFT) &
 						   PAGE_MASK,
 					   left) < 0)) {
-			pr_err("ZFile: error decompressing %llu\n",
+			PRINT_ERROR("ZFile: error decompressing %llu\n",
 			       (iter.bi_sector << SECTOR_SHIFT) & PAGE_MASK);
 			bio_io_error(bio);
 			break;
@@ -196,26 +207,26 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	struct decompress_work *cmd;
 
 	if (unlikely(nr != 1 || !dm_dev[0])) {
-		pr_err("ZFile: nr wrong\n");
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("ZFile: nr wrong\n");
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely(bio_op(bio) != REQ_OP_READ)) {
-		pr_err("ZFile: REQ not read\n");
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("ZFile: REQ not read\n");
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely((offset << SECTOR_SHIFT) >= zf->header.vsize)) {
-		pr_err("ZFile: %lld over tail\n", offset);
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("ZFile: %lld over tail\n", offset);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely(((offset + count) << SECTOR_SHIFT) > zf->header.vsize)) {
-		pr_err("ZFile: %lld over tail\n", offset);
-		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		PRINT_ERROR("ZFile: %lld over tail\n", offset);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
@@ -226,7 +237,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	cmd->bio = bio;
 	cmd->zf = zf;
 
-	BUG_ON(!queue_work(zf->wq, &cmd->work));
+	BUG_ON(!queue_work(get_ovbd_context()->wq, &cmd->work));
 
 	return DM_MAPIO_SUBMITTED;
 }
@@ -302,14 +313,6 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	if (ret)
 		goto error_out;
 
-	zfile->onlinecpus = num_possible_cpus();
-	const unsigned int flags =
-		WQ_UNBOUND | WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_CPU_INTENSIVE;
-	zfile->wq = alloc_workqueue("zfile_unzip", flags,
-				    zfile->onlinecpus + zfile->onlinecpus / 4);
-	if (IS_ERR(zfile->wq))
-		goto error_out;
-
 	zfile->c = dm_bufio_client_create(bdev, 4096, 2, 0, NULL, NULL);
 	if (IS_ERR(zfile->c))
 		goto error_out;
@@ -329,11 +332,6 @@ static void zfile_close(struct vfile *f)
 
 	PRINT_INFO("close(%p)", (void *)f);
 	if (zfile) {
-		if (zfile->wq && !IS_ERR(zfile->wq)) {
-			flush_workqueue(zfile->wq);
-			destroy_workqueue(zfile->wq);
-			zfile->wq = NULL;
-		}
 		if (zfile->jump) {
 			vfree(zfile->jump);
 			zfile->jump = NULL;
