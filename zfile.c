@@ -22,13 +22,6 @@ static const uuid_t MAGIC1 = UUID_INIT(0x74756a69, 0x2e79, 0x7966, 0x40, 0x41,
 // 1:YES,       0:NO  				# skip it now.
 #define FLAG_SHIFT_HEADER_OVERWRITE 3
 
-enum zfile_page_state {
-	ZFILE_PAGE_INPLACE = 0,
-	ZFILE_PAGE_READING = 1,
-	ZFILE_PAGE_UPTODATE = 2,
-	ZFILE_PAGE_ERROR = 3,
-};
-
 static size_t zfile_len(IFile *fp);
 static void zfile_close(IFile *ctx);
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
@@ -72,8 +65,7 @@ static void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 	}
 }
 
-static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
-			 loff_t holder_off)
+static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 {
 	void *dst = NULL;
 	void *src = NULL;
@@ -90,13 +82,13 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 	left = begin & PAGE_MASK;
 	right = ((begin + c_cnt) + (PAGE_SIZE - 1)) & PAGE_MASK;
 
-	if (right - left == PAGE_SIZE) {
+	if (likely(right - left == PAGE_SIZE)) {
 		src = dm_bufio_read(zf->c, left >> PAGE_SHIFT, &buf);
 		BUG_ON(IS_ERR(buf));
 		BUG_ON(IS_ERR(src));
 		src = src + (begin - left);
 	} else {
-		tmp = src = kmalloc(right - left, GFP_NOIO);
+		tmp = kmalloc(right - left, GFP_KERNEL);
 		for (i = left; i < right; i += PAGE_SIZE) {
 			void *d = dm_bufio_read(zf->c, i >> PAGE_SHIFT, &buf);
 			BUG_ON(IS_ERR(buf));
@@ -108,7 +100,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 	}
 
 	dst = kmap_atomic(page);
-	// prefetch_range(src, c_cnt);
+
 	prefetchw(dst);
 
 	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
@@ -125,7 +117,21 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 		dm_bufio_release(buf);
 	}
 
-	return ret;
+	return 0;
+}
+
+static void do_decompress(struct zfile *zf, struct bio *bio, size_t left,
+			  int nr)
+{
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	bio_for_each_segment (bv, bio, iter) {
+		if (unlikely(zf_decompress(zf, bv.bv_page, (iter.bi_sector << SECTOR_SHIFT)) < 0)) {
+			bio_io_error(bio);
+			return;
+		}
+	}
+	bio_endio(bio);
 }
 
 struct decompress_work {
@@ -133,29 +139,6 @@ struct decompress_work {
 	struct zfile *zf;
 	struct bio *bio;
 };
-
-static void do_decompress(struct zfile *zf, struct bio *bio, size_t left,
-			  int nr)
-{
-	struct bio_vec bv;
-	struct bvec_iter iter;
-
-	// now pages are referenced, will not release
-
-	bio_for_each_segment (bv, bio, iter) {
-		if (unlikely(zf_decompress(zf, bv.bv_page,
-					   (iter.bi_sector << SECTOR_SHIFT) &
-						   PAGE_MASK,
-					   left) < 0)) {
-			PRINT_ERROR("ZFile: error decompressing %llu\n",
-			       (iter.bi_sector << SECTOR_SHIFT) & PAGE_MASK);
-			bio_io_error(bio);
-			break;
-		}
-	}
-
-	bio_endio(bio);
-}
 
 static void decompress_fn(struct work_struct *work)
 {
@@ -180,22 +163,21 @@ static void decompress_fn(struct work_struct *work)
 	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
 	nr = (right - left) >> PAGE_SHIFT;
 
+#ifdef ZFILE_READAHEAD
 	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, max(32LL, nr));
+#else
+	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, nr);
+#endif
 
 	do_decompress(cmd->zf, cmd->bio, left, nr);
 
+#ifdef ZFILE_CLEANUP_CACHE
 	dm_bufio_forget_buffers(cmd->zf->c, left >> PAGE_SHIFT,
 				nr - (right > begin + range) ? 1 : 0);
+#endif
 
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
-
-struct readahead_work {
-	struct work_struct work;
-	struct address_space *mapping;
-	loff_t left;
-	int nr;
-};
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			  unsigned int nr)
@@ -309,13 +291,14 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 		goto error_out;
 
 	ret = bioset_init(&zfile->bioset, 4096, 0,
-			  BIOSET_NEED_BVECS | BIOSET_NEED_RESCUER);
+			  BIOSET_NEED_BVECS);
 	if (ret)
 		goto error_out;
 
 	zfile->c = dm_bufio_client_create(bdev, 4096, 2, 0, NULL, NULL);
 	if (IS_ERR(zfile->c))
 		goto error_out;
+	
 	return (IFile *)zfile;
 
 error_out:

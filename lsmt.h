@@ -48,6 +48,7 @@ struct lsmt_ro_file {
 	int nr;
 	struct lsmt_ht ht;
 	struct lsmt_ro_index *index;
+	struct bio_set split_set;
 	IFile *fp[0];
 };
 

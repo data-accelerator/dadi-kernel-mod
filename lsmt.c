@@ -196,17 +196,17 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 		s.length = bio_sectors(bio);
 		int n = ro_index_lookup(fp->index, &s, m, 16);
 		for (i = 0; i < n; ++i) {
+			s.offset = bio->bi_iter.bi_sector;
+			s.length = bio_sectors(bio);
 			if (s.offset < m[i].offset) {
 				// hole
-				if (m[i].offset - s.offset < bio_sectors(bio)) {
+				if (m[i].offset - s.offset < s.length) {
 					subbio = bio_split(
 						bio, m[i].offset - s.offset,
-						GFP_NOIO, NULL);
+						GFP_NOIO, &fp->split_set);
 					bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
-					s.length -= m[i].offset - s.offset;
-					s.offset = m[i].offset;
 				} else {
 					zero_fill_bio(bio);
 					bio_endio(bio);
@@ -215,14 +215,12 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 			}
 			// zeroe block
 			if (m[i].zeroed) {
-				if (m[i].length < bio_sectors(bio)) {
+				if (m[i].length < s.length) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO, NULL);
+							   GFP_NOIO, &fp->split_set);
 					bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
-					s.length -= m[i].length;
-					s.offset = m[i].offset + m[i].length;
 				} else {
 					zero_fill_bio(bio);
 					bio_endio(bio);
@@ -230,15 +228,13 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 				}
 			} else {
 				bio_set_dev(bio, dev[m[i].tag]->bdev);
-				if (m[i].length < bio_sectors(bio)) {
+				if (m[i].length < s.length) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO, NULL);
+							   GFP_NOIO, &fp->split_set);
 					subbio->bi_iter.bi_sector =
 						m[i].moffset;
 					bio_chain(subbio, bio);
 					submit_bio(subbio);
-					s.length -= m[i].length;
-					s.offset = m[i].offset + m[i].length;
 				} else {
 					bio->bi_iter.bi_sector = m[i].moffset;
 					submit_bio(bio);
@@ -289,6 +285,7 @@ static void lsmt_close(IFile *ctx)
 	}
 	vfree(lsmt_file->index->mapping);
 	kfree(lsmt_file->index);
+	bioset_exit(&lsmt_file->split_set);
 	kfree(lsmt_file);
 }
 
@@ -503,14 +500,22 @@ error_ret:
 IFile *lsmt_open_files(IFile *zfiles[], int n)
 {
 	PRINT_INFO("LSMT open_files, layers: %d", n);
-	struct lsmt_ro_file *ret = (struct lsmt_ro_file *)kmalloc(
+	struct lsmt_ro_file *ret = (struct lsmt_ro_file *)kzalloc(
 		sizeof(IFile *) * n + sizeof(struct lsmt_ro_file), GFP_KERNEL);
+	if (!ret) {
+		PRINT_ERROR("Failed to alloc");
+		return NULL;
+	}
 	struct lsmt_ht ht;
 	struct lsmt_ro_index *idx = load_merge_index(zfiles, n, &ht);
 	if (idx == NULL) {
 		PRINT_ERROR("load merge index failed.");
-		kfree(ret);
-		return NULL;
+		goto error_out;
+	}
+	PRINT_INFO("Initial bio set");
+	if (bioset_init(&ret->split_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS)) {
+		PRINT_ERROR("Initial bio set failed");
+		goto error_out;
 	}
 	ret->nr = n;
 	ret->index = idx;
@@ -520,4 +525,7 @@ IFile *lsmt_open_files(IFile *zfiles[], int n)
 	PRINT_DEBUG("ret->fp[0]: %p", &(ret->fp[0]));
 	memcpy(&(ret->fp[0]), &zfiles[0], n * sizeof(IFile *));
 	return (IFile *)ret;
+error_out:
+	kfree(ret);
+	return NULL;
 }

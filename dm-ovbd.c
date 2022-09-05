@@ -4,20 +4,18 @@ static ovbd_context global_ovbd_context;
 
 int init_ovbd_target(void)
 {
-	int onlinecpus = num_possible_cpus();
-	if (onlinecpus < 1) return -1;
-	const unsigned int flags =
-		WQ_UNBOUND | WQ_HIGHPRI;
-	global_ovbd_context.wq = alloc_workqueue("ovbd", flags,
-				    onlinecpus + onlinecpus / 4	);
+	global_ovbd_context.wq = alloc_workqueue("ovbd", WQ_UNBOUND | WQ_HIGHPRI, WQ_DFL_ACTIVE);
 	if (IS_ERR(global_ovbd_context.wq))
 		return -1;
-	if (init_lsmt_target() < 0)
-		return -1;
+	if (init_lsmt_target() < 0) 
+		goto error_out;
 	if (init_zfile_target() < 0)
-		return -1;
+		goto error_out;
 	PRINT_INFO("OVBD initialized");
 	return 0;
+error_out:
+	destroy_workqueue(global_ovbd_context.wq);
+	return -1;
 }
 
 void cleanup_ovbd_target(void)
