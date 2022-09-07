@@ -4,6 +4,7 @@
 #include <linux/kthread.h>
 #include <linux/uuid.h>
 #include <linux/dm-bufio.h>
+#include <linux/pagemap.h>
 
 #include "vfile.h"
 
@@ -58,6 +59,8 @@ struct zfile {
 	struct zfile_ht header;
 	struct jump_table *jump;
 	struct bio_set bioset;
+	struct address_space *mapping;
+	struct block_device *bdev;
 	mempool_t cmdpool;
 	struct dm_bufio_client *c;
 };
