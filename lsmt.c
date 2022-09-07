@@ -3,7 +3,7 @@
 #include "zfile.h"
 #include "log-format.h"
 
-#define REVERSE_LIST(type, begin, back)                                        \
+#define REVERSE_ARRAY(type, begin, back)                                        \
 	{                                                                      \
 		type *l = (begin);                                             \
 		type *r = (back);                                              \
@@ -136,29 +136,18 @@ static size_t ro_index_size(const struct lsmt_ro_index *index)
 
 static struct lsmt_ro_index *
 create_memory_index(const struct segment_mapping *pmappings, size_t n,
-		    uint64_t moffset_begin, uint64_t moffset_end, bool copy)
+		    uint64_t moffset_begin, uint64_t moffset_end)
 {
 	struct lsmt_ro_index *ret = NULL;
-	int index_size = sizeof(struct lsmt_ro_index);
-	if (copy) {
-		index_size += sizeof(struct segment_mapping) * n;
-	}
-	ret = (struct lsmt_ro_index *)vmalloc(index_size);
+	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index), GFP_KERNEL);
 	if (!ret) {
 		PRINT_ERROR("malloc memory failed");
 		return NULL;
 	}
-	if (!copy) {
-		ret->pbegin = pmappings;
-		ret->pend = pmappings + n;
-	} else {
-		memcpy(ret->mapping, pmappings,
-		       n * sizeof(struct segment_mapping));
-		ret->pbegin = ret->mapping;
-		ret->pend = ret->mapping + n;
-	}
-	PRINT_INFO("create memory index done. {index_count: %lu, memcopy: %d}",
-		   n, copy);
+	ret->pbegin = pmappings;
+	ret->pend = pmappings + n;
+	ret->mapping = (struct segment_mapping*)pmappings;
+	PRINT_INFO("create memory index done. {index_count: %lu}", n);
 	return ret;
 };
 
@@ -290,7 +279,7 @@ static void lsmt_close(IFile *ctx)
 }
 
 static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
-			 struct segment_mapping *mappings[], size_t *size,
+			 struct segment_mapping **mappings, size_t *size,
 			 size_t *capacity, uint64_t start, uint64_t end)
 {
 	if (level >= n) {
@@ -301,6 +290,7 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 							       start);
 	const struct segment_mapping *pend = indexes[level]->pend;
 	if (p == pend) {
+		PRINT_DEBUG("index=%p p=%p pend=%p", indexes[level], p, pend);
 		merge_indexes(level + 1, indexes, n, mappings, size, capacity,
 			      start, end);
 		return 0;
@@ -332,6 +322,7 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 			}
 			memcpy(m, *mappings,
 			       *capacity * sizeof(struct segment_mapping));
+			vfree(*mappings);
 			*mappings = m;
 			*capacity = tmp;
 		}
@@ -339,8 +330,8 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 		(*mappings)[*size] = it;
 		(*size)++;
 		start = segment_end(p);
-		// PRINT_DEBUG("push segment %d {offset: %lu, len: %lu}",
-		// 	*size, p->offset, p->length);
+		PRINT_DEBUG("push segment %ld {offset: %lu, len: %u}",
+			*size, it.offset + 0UL, it.length);
 		p++;
 		it = *p;
 	}
@@ -360,11 +351,12 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	struct lsmt_ro_index *ret = NULL;
 	struct segment_mapping *mappings = (struct segment_mapping *)vmalloc(
 		sizeof(struct segment_mapping) * capacity);
-	if (!mappings) {
+	if (IS_ERR_OR_NULL(mappings)) {
 		PRINT_ERROR("Failed to alloc mapping memory\n");
 		goto err_ret;
 	}
 	PRINT_DEBUG("start merge indexes, layers: %lu", n);
+
 	merge_indexes(0, indexes, n, &mappings, &size, &capacity, 0,
 		      UINT64_MAX);
 	PRINT_INFO("merge done, index size: %lu", size);
@@ -379,6 +371,7 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	ret->pend = tmp + size;
 	ret->mapping = tmp;
 	PRINT_INFO("ret index done. size: %lu", size);
+	vfree(mappings);
 	return ret;
 
 err_ret:
@@ -467,7 +460,7 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 		}
 		struct lsmt_ro_index *pi = create_memory_index(
 			p, ht->index_size, HT_SPACE / ALIGNMENT,
-			ht->index_offset / ALIGNMENT, false);
+			ht->index_offset / ALIGNMENT);
 		if (!pi) {
 			PRINT_ERROR(
 				"failed to create memory index! ( %d-th file )",
@@ -476,13 +469,13 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			goto error_ret;
 		}
 		indexes[i] = pi;
-		vfree(p);
 	}
-	PRINT_INFO("reverse index.");
-	REVERSE_LIST(IFile *, &files[0], &files[n - 1]);
-	REVERSE_LIST(struct lsmt_ro_index *, &indexes[0], &indexes[n - 1]);
 
-	pmi = merge_memory_indexes(&indexes[0], n);
+	PRINT_INFO("reverse index.");
+	REVERSE_ARRAY(IFile *, &files[0], &files[n - 1]);
+	REVERSE_ARRAY(struct lsmt_ro_index *, &indexes[0], &indexes[n - 1]);
+
+	pmi = merge_memory_indexes(indexes, n);
 
 	if (!pmi) {
 		PRINT_ERROR("failed to merge indexes");
