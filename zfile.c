@@ -103,7 +103,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 
 	prefetchw(dst);
 
-	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
+	ret = LZ4_decompress_fast(src, dst, PAGE_SIZE);
 
 	kunmap_atomic(dst);
 
