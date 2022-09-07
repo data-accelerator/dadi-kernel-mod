@@ -85,7 +85,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 
 	prefetchw(dst);
 
-	ret = LZ4_decompress_safe(src, dst, c_cnt, PAGE_SIZE);
+	ret = LZ4_decompress_fast(src, dst, PAGE_SIZE);
 
 	kunmap_atomic(dst);
 
@@ -195,6 +195,14 @@ static void zfile_read_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+static inline struct bio* zfile_bio_alloc_bioset(struct block_device* bdev, int nr, int op, gfp_t gfp, struct bio_set* bioset) {
+	struct bio* bio = bio_alloc_bioset(gfp, nr, bioset);
+	if (IS_ERR_OR_NULL(bio)) return bio;
+	bio_set_dev(bio, bdev);
+	bio_set_op_attrs(bio, op, 0);
+	return bio;
+}
+
 static void decompress_slowpath(struct work_struct *work)
 {
 	size_t start_idx, end_idx, begin, range, left, right, i;
@@ -205,6 +213,7 @@ static void decompress_slowpath(struct work_struct *work)
 	struct compressed_page_list *cpl, *next;
 	struct bio *bio;
 	struct page *page;
+	struct blk_plug plug;
 
 	BUG_ON(!work);
 	BUG_ON(!cmd);
@@ -224,12 +233,16 @@ static void decompress_slowpath(struct work_struct *work)
 
 	LIST_HEAD(list);
 
+	blk_start_plug(&plug);
+
 	for (i = left; i < right; i += PAGE_SIZE) {
 		cpl = kmalloc(sizeof(struct compressed_page_list), GFP_KERNEL);
 		list_add_tail(&cpl->list, &list);
 		cpl->page = read_cache_page_gfp(cmd->zf->mapping,
 						i >> SECTOR_SHIFT, GFP_KERNEL);
 	}
+
+	blk_finish_plug(&plug);
 
 	do_decompress(cmd->zf, cmd->bio, left, nr, &list, GFP_KERNEL);
 
@@ -239,13 +252,15 @@ static void decompress_slowpath(struct work_struct *work)
 		kfree(cpl);
 	}
 
+	blk_start_plug(&plug);
+
 	for (i = right;
-	     i < min(right + 64ULL * PAGE_SIZE, cmd->zf->header.vsize);
+	     i < min(right + 8ULL * PAGE_SIZE, cmd->zf->header.vsize);
 	     i += PAGE_SIZE) {
 		page = zfile_grab_cache_page_nowait(cmd->zf->mapping,
 						    i >> SECTOR_SHIFT);
 		if (page && !PageUptodate(page)) {
-			bio = bio_alloc_bioset(cmd->zf->bdev, 1, REQ_OP_READ,
+			bio = zfile_bio_alloc_bioset(cmd->zf->bdev, 1, REQ_OP_READ,
 					       GFP_KERNEL, &cmd->zf->bioset);
 			BUG_ON(!bio);
 			bio_add_page(bio, page, PAGE_SIZE, 0);
@@ -262,6 +277,7 @@ static void decompress_slowpath(struct work_struct *work)
 			break;
 		}
 	}
+	blk_finish_plug(&plug);
 
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
@@ -325,12 +341,15 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	bool slowpath = false;
 
+	struct blk_plug plug;
+	blk_start_plug(&plug);
+
 	for (i = left; i < right; i += PAGE_SIZE) {
 		page = zfile_grab_cache_page_nowait(zf->mapping,
 						    i >> SECTOR_SHIFT);
 		if (!page || !PageUptodate(page)) {
 			if (page) {
-				cbio = bio_alloc_bioset(zf->bdev, 1,
+				cbio = zfile_bio_alloc_bioset(zf->bdev, 1,
 							REQ_OP_READ, GFP_NOIO,
 							&zf->bioset);
 				BUG_ON(!cbio);
@@ -351,6 +370,8 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			list_add_tail(&cpl->list, &list);
 		}
 	}
+
+	blk_finish_plug(&plug);
 
 	if (slowpath)
 		goto slow_path;
