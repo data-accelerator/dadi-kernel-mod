@@ -173,7 +173,7 @@ static void decompress_fn(struct work_struct *work)
 
 #ifdef ZFILE_CLEANUP_CACHE
 	dm_bufio_forget_buffers(cmd->zf->c, left >> PAGE_SHIFT,
-				nr - (right > begin + range) ? 1 : 0);
+				nr - ((right > begin + range) ? 1 : 0));
 #endif
 
 	mempool_free(cmd, &cmd->zf->cmdpool);
@@ -295,7 +295,7 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	if (ret)
 		goto error_out;
 
-	zfile->c = dm_bufio_client_create(bdev, 4096, 2, 0, NULL, NULL);
+	zfile->c = dm_bufio_client_create(bdev, 4096, 128, 0, NULL, NULL);
 	if (IS_ERR(zfile->c))
 		goto error_out;
 	
