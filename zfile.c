@@ -298,6 +298,7 @@ static void decompress_fast(struct work_struct* work) {
 		list_del(&cpl->list);
 		kfree(cpl);
 	}
+	mempool_free(cmd, &cmd->zf->fcmdpool);
 }
 
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -392,7 +393,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	PRINT_DEBUG("Fast path %lu %lld", left, page_nr);
 
-	fcmd = kmalloc(sizeof(struct decompress_work_fast), GFP_NOIO);
+	fcmd = mempool_alloc(&zf->fcmdpool, GFP_NOIO);
 	if (IS_ERR_OR_NULL(fcmd))
 		goto slow_path;
 
@@ -493,6 +494,12 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	if (ret)
 		goto error_out;
 
+	ret = mempool_init_kmalloc_pool(&zfile->fcmdpool, 4096,
+					sizeof(struct decompress_work_fast));
+	if (ret)
+		goto error_out;
+
+
 	ret = bioset_init(&zfile->bioset, 4096, 0, BIOSET_NEED_BVECS);
 	if (ret)
 		goto error_out;
@@ -508,6 +515,7 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 
 error_out:
 	if (zfile) {
+		mempool_exit(&zfile->fcmdpool);
 		mempool_exit(&zfile->cmdpool);
 		zfile_close((struct vfile *)zfile);
 	}
@@ -526,6 +534,7 @@ static void zfile_close(struct vfile *f)
 		}
 		zfile->fp = NULL;
 		bioset_exit(&zfile->bioset);
+		mempool_exit(&zfile->fcmdpool);
 		mempool_exit(&zfile->cmdpool);
 		dm_bufio_client_destroy(zfile->c);
 		kfree(zfile);

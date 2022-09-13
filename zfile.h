@@ -62,6 +62,7 @@ struct zfile {
 	struct address_space *mapping;
 	struct block_device *bdev;
 	mempool_t cmdpool;
+	mempool_t fcmdpool;
 	struct dm_bufio_client *c;
 };
 
