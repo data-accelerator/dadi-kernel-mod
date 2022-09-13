@@ -40,11 +40,11 @@ static uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
 
 static bool is_header_overwrite(struct zfile_ht *ht)
 {
-	#ifdef ZFILE_HEAD_OVERWRITE
-		return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
-	#else
-		return false;
-	#endif
+#ifdef ZFILE_HEAD_OVERWRITE
+	return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
+#else
+	return false;
+#endif
 }
 
 static size_t zfile_len(struct vfile *zfile)
@@ -65,6 +65,12 @@ static void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
 	}
 }
 
+enum decompress_result {
+	ZFILE_DECOMP_ERROR = -1,
+	ZFILE_DECOMP_OK = 0,
+	ZFILE_DECOMP_NOT_READY = 1,
+};
+
 static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 {
 	void *dst = NULL;
@@ -83,14 +89,20 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	right = ((begin + c_cnt) + (PAGE_SIZE - 1)) & PAGE_MASK;
 
 	if (likely(right - left == PAGE_SIZE)) {
-		src = dm_bufio_read(zf->c, left >> PAGE_SHIFT, &buf);
+		src = dm_bufio_get(zf->c, left >> PAGE_SHIFT, &buf);
+		if (IS_ERR_OR_NULL(src)) {
+			return ZFILE_DECOMP_NOT_READY;
+		}
 		BUG_ON(IS_ERR(buf));
 		BUG_ON(IS_ERR(src));
 		src = src + (begin - left);
 	} else {
 		tmp = kmalloc(right - left, GFP_KERNEL);
 		for (i = left; i < right; i += PAGE_SIZE) {
-			void *d = dm_bufio_read(zf->c, i >> PAGE_SHIFT, &buf);
+			void *d = dm_bufio_get(zf->c, i >> PAGE_SHIFT, &buf);
+			if (IS_ERR_OR_NULL(d)) {
+				return ZFILE_DECOMP_NOT_READY;
+			}
 			BUG_ON(IS_ERR(buf));
 			BUG_ON(IS_ERR(d));
 			memcpy(tmp + i - left, d, PAGE_SIZE);
@@ -117,21 +129,24 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 		dm_bufio_release(buf);
 	}
 
-	return 0;
+	return ZFILE_DECOMP_OK;
 }
 
-static void do_decompress(struct zfile *zf, struct bio *bio, size_t left,
-			  int nr)
+static int do_decompress(struct zfile *zf, struct bio *bio, size_t left, int nr)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
 	bio_for_each_segment (bv, bio, iter) {
-		if (unlikely(zf_decompress(zf, bv.bv_page, (iter.bi_sector << SECTOR_SHIFT)) < 0)) {
-			bio_io_error(bio);
-			return;
+		int ret = zf_decompress(zf, bv.bv_page,
+					(iter.bi_sector << SECTOR_SHIFT));
+		if (unlikely(ret != ZFILE_DECOMP_OK)) {
+			if (ret == ZFILE_DECOMP_ERROR)
+				bio_io_error(bio);
+			return ret;
 		}
 	}
 	bio_endio(bio);
+	return ZFILE_DECOMP_OK;
 }
 
 struct decompress_work {
@@ -140,6 +155,24 @@ struct decompress_work {
 	struct bio *bio;
 };
 
+inline static void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
+{
+#ifdef ZFILE_READAHEAD
+	size_t prefetch_page = 32;
+#else
+	size_t prefetch_page = 0;
+#endif
+	dm_bufio_prefetch(zf->c, left >> PAGE_SHIFT, nr + prefetch_page);
+}
+
+inline static void zfile_cleanup_compressed_cache(struct zfile *zf, size_t left,
+						  size_t nr)
+{
+#ifdef ZFILE_CLEANUP_CACHE
+	dm_bufio_forget_buffers(zf->c, left >> PAGE_SHIFT, nr);
+#endif
+}
+
 static void decompress_fn(struct work_struct *work)
 {
 	size_t start_idx, end_idx, begin, range, left, right;
@@ -147,6 +180,7 @@ static void decompress_fn(struct work_struct *work)
 	size_t bs;
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
+	struct decompress_work *res;
 	BUG_ON(!work);
 	BUG_ON(!cmd);
 	offset = cmd->bio->bi_iter.bi_sector;
@@ -163,18 +197,27 @@ static void decompress_fn(struct work_struct *work)
 	right = (begin + range + PAGE_SIZE - 1) & PAGE_MASK;
 	nr = (right - left) >> PAGE_SHIFT;
 
-#ifdef ZFILE_READAHEAD
-	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, max(32LL, nr));
-#else
+	zfile_prefetch(cmd->zf, left, nr);
+
+	if (unlikely(do_decompress(cmd->zf, cmd->bio, left, nr) ==
+		     ZFILE_DECOMP_NOT_READY)) {
+		goto resubmit;
+	}
+
+	zfile_cleanup_compressed_cache(cmd->zf, left,
+				       nr - ((right > begin + range) ? 1 : 0));
+
+	mempool_free(cmd, &cmd->zf->cmdpool);
+
+	return;
+
+resubmit:
 	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, nr);
-#endif
-
-	do_decompress(cmd->zf, cmd->bio, left, nr);
-
-#ifdef ZFILE_CLEANUP_CACHE
-	dm_bufio_forget_buffers(cmd->zf->c, left >> PAGE_SHIFT,
-				nr - ((right > begin + range) ? 1 : 0));
-#endif
+	res = mempool_alloc(&cmd->zf->cmdpool, GFP_NOIO);
+	INIT_WORK(&res->work, decompress_fn);
+	res->zf = cmd->zf;
+	res->bio = cmd->bio;
+	BUG_ON(!queue_work(get_ovbd_context()->wq, &res->work));
 
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
@@ -190,26 +233,26 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	if (unlikely(nr != 1 || !dm_dev[0])) {
 		PRINT_ERROR("ZFile: nr wrong\n");
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely(bio_op(bio) != REQ_OP_READ)) {
 		PRINT_ERROR("ZFile: REQ not read\n");
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely((offset << SECTOR_SHIFT) >= zf->header.vsize)) {
 		PRINT_ERROR("ZFile: %lld over tail\n", offset);
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 	if (unlikely(((offset + count) << SECTOR_SHIFT) > zf->header.vsize)) {
 		PRINT_ERROR("ZFile: %lld over tail\n", offset);
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 
@@ -290,15 +333,14 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	if (ret)
 		goto error_out;
 
-	ret = bioset_init(&zfile->bioset, 4096, 0,
-			  BIOSET_NEED_BVECS);
+	ret = bioset_init(&zfile->bioset, 4096, 0, BIOSET_NEED_BVECS);
 	if (ret)
 		goto error_out;
 
 	zfile->c = dm_bufio_client_create(bdev, 4096, 128, 0, NULL, NULL);
-	if (IS_ERR(zfile->c))
+	if (IS_ERR_OR_NULL(zfile->c))
 		goto error_out;
-	
+
 	return (IFile *)zfile;
 
 error_out:
@@ -322,7 +364,8 @@ static void zfile_close(struct vfile *f)
 		zfile->fp = NULL;
 		bioset_exit(&zfile->bioset);
 		mempool_exit(&zfile->cmdpool);
-		dm_bufio_client_destroy(zfile->c);
+		if (!IS_ERR_OR_NULL((zfile->c)))
+			dm_bufio_client_destroy(zfile->c);
 		kfree(zfile);
 	}
 }

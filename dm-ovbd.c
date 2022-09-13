@@ -6,7 +6,7 @@ int init_ovbd_target(void)
 {
 	global_ovbd_context.wq =
 		alloc_workqueue("ovbd", WQ_UNBOUND | WQ_HIGHPRI,
-				num_online_cpus() + num_online_cpus() / 4);
+				num_online_cpus() * 2);
 	if (IS_ERR(global_ovbd_context.wq))
 		return -1;
 	if (init_lsmt_target() < 0) 
