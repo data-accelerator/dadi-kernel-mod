@@ -165,10 +165,10 @@ struct decompress_work {
 static inline struct page *
 zfile_grab_cache_page_nowait(struct address_space *mapping, pgoff_t index)
 {
-	// return pagecache_get_page(mapping, index,
-	// 			  FGP_LOCK | FGP_CREAT | FGP_NOFS | FGP_NOWAIT,
-	// 			  readahead_gfp_mask(mapping) & ~__GFP_RECLAIM);
-	return grab_cache_page_nowait(mapping, index);
+	return pagecache_get_page(mapping, index,
+				  FGP_LOCK | FGP_CREAT | FGP_NOFS | FGP_NOWAIT,
+				  readahead_gfp_mask(mapping) & ~__GFP_RECLAIM);
+	// return grab_cache_page_nowait(mapping, index);
 }
 
 static void zfile_read_endio(struct bio *bio)
@@ -197,6 +197,8 @@ static void zfile_read_endio(struct bio *bio)
 
 static inline struct bio* zfile_bio_alloc_bioset(struct block_device* bdev, int nr, int op, gfp_t gfp, struct bio_set* bioset) {
 	struct bio* bio = bio_alloc_bioset(gfp, nr, bioset);
+	// struct bio* bio = bio_kmalloc(GFP_NOWAIT | __GFP_NORETRY | __GFP_NOWARN, 1);
+	// if (IS_ERR_OR_NULL(bio)) bio = bio_alloc_bioset(gfp, nr, bioset);
 	if (IS_ERR_OR_NULL(bio)) return bio;
 	bio_set_dev(bio, bdev);
 	bio_set_op_attrs(bio, op, 0);
@@ -233,16 +235,12 @@ static void decompress_slowpath(struct work_struct *work)
 
 	LIST_HEAD(list);
 
-	blk_start_plug(&plug);
-
 	for (i = left; i < right; i += PAGE_SIZE) {
 		cpl = kmalloc(sizeof(struct compressed_page_list), GFP_KERNEL);
 		list_add_tail(&cpl->list, &list);
 		cpl->page = read_cache_page_gfp(cmd->zf->mapping,
 						i >> SECTOR_SHIFT, GFP_KERNEL);
 	}
-
-	blk_finish_plug(&plug);
 
 	do_decompress(cmd->zf, cmd->bio, left, nr, &list, GFP_KERNEL);
 
@@ -282,6 +280,26 @@ static void decompress_slowpath(struct work_struct *work)
 	mempool_free(cmd, &cmd->zf->cmdpool);
 }
 
+struct decompress_work_fast {
+	struct work_struct work;
+	struct zfile *zf;
+	struct bio *bio;
+	size_t left;
+	loff_t page_nr;
+	struct list_head list;
+};
+
+static void decompress_fast(struct work_struct* work) {
+	struct compressed_page_list *cpl, *next;
+	struct decompress_work_fast* cmd = container_of(work, struct decompress_work_fast, work);
+	do_decompress(cmd->zf, cmd->bio, cmd->left, cmd->page_nr, &cmd->list, GFP_KERNEL);
+	list_for_each_entry_safe (cpl, next, &cmd->list, list) {
+		put_page(cpl->page);
+		list_del(&cpl->list);
+		kfree(cpl);
+	}
+}
+
 static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			  unsigned int nr)
 {
@@ -290,6 +308,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	size_t count = bio_sectors(bio);
 
 	struct decompress_work *cmd;
+	struct decompress_work_fast *fcmd;
 	struct page *page;
 	struct compressed_page_list *cpl, *next;
 	struct bio *cbio;
@@ -341,9 +360,6 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	bool slowpath = false;
 
-	struct blk_plug plug;
-	blk_start_plug(&plug);
-
 	for (i = left; i < right; i += PAGE_SIZE) {
 		page = zfile_grab_cache_page_nowait(zf->mapping,
 						    i >> SECTOR_SHIFT);
@@ -371,16 +387,26 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 		}
 	}
 
-	blk_finish_plug(&plug);
-
 	if (slowpath)
 		goto slow_path;
 
 	PRINT_DEBUG("Fast path %lu %lld", left, page_nr);
 
-	do_decompress(zf, bio, left, page_nr, &list, GFP_NOIO);
+	fcmd = kmalloc(sizeof(struct decompress_work_fast), GFP_NOIO);
+	if (IS_ERR_OR_NULL(fcmd))
+		goto slow_path;
 
-	goto out;
+	INIT_WORK(&fcmd->work, decompress_fast);
+	fcmd->bio = bio;
+	fcmd->zf = zf;
+	INIT_LIST_HEAD(&fcmd->list);
+	list_replace(&list, &fcmd->list);
+	fcmd->page_nr = page_nr;
+	fcmd->left = left;
+
+	BUG_ON(!queue_work(get_ovbd_context()->wq, &fcmd->work));
+
+	return DM_MAPIO_SUBMITTED;
 
 slow_path:
 	PRINT_DEBUG("Slow path %lu %lld", left, page_nr);
@@ -392,7 +418,6 @@ slow_path:
 
 	BUG_ON(!queue_work(get_ovbd_context()->wq, &cmd->work));
 
-out:
 	list_for_each_entry_safe (cpl, next, &list, list) {
 		put_page(cpl->page);
 		list_del(&cpl->list);

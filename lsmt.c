@@ -3,7 +3,7 @@
 #include "zfile.h"
 #include "log-format.h"
 
-#define REVERSE_ARRAY(type, begin, back)                                        \
+#define REVERSE_ARRAY(type, begin, back)                                       \
 	{                                                                      \
 		type *l = (begin);                                             \
 		type *r = (back);                                              \
@@ -81,26 +81,22 @@ static void trim_edge(void *m, const struct segment *bound_segment,
 static const struct segment_mapping *
 ro_index_lower_bound(const struct lsmt_ro_index *index, uint64_t offset)
 {
-	const struct segment_mapping *l = index->pbegin;
-	const struct segment_mapping *r = index->pend - 1;
-	const struct segment_mapping *pret;
-	int ret = -1;
-	while (l <= r) {
-		int m = ((l - index->pbegin) + (r - index->pbegin)) >> 1;
-		const struct segment_mapping *cmp = index->pbegin + m;
-		if (offset >= segment_end(cmp)) {
-			ret = m;
-			l = index->pbegin + (m + 1);
+	size_t l = 0;
+	size_t r = index->n;
+
+	while (l < r - 1) {
+		size_t m = (l + r) >> 1;
+		if (offset < index->mapping[m].offset) {
+			r = m;
 		} else {
-			r = index->pbegin + (m - 1);
+			l = m;
 		}
 	}
-	pret = index->pbegin + (ret + 1);
-	if (pret >= index->pend) {
-		return index->pend;
-	} else {
-		return pret;
+	if (l == index->n - 1) {
+		if (offset >= segment_end(&index->mapping[index->n - 1]))
+			l = index->n;
 	}
+	return &index->mapping[l];
 }
 
 static int ro_index_lookup(const struct lsmt_ro_index *index,
@@ -112,7 +108,8 @@ static int ro_index_lookup(const struct lsmt_ro_index *index,
 	const struct segment_mapping *lb =
 		ro_index_lower_bound(index, query_segment->offset);
 	int cnt = 0;
-	for (const struct segment_mapping *it = lb; it != index->pend; it++) {
+	for (const struct segment_mapping *it = lb;
+	     it != &index->mapping[index->n]; it++) {
 		if (it->offset >= segment_end(query_segment))
 			break;
 		ret_mappings[cnt++] = *it;
@@ -129,24 +126,19 @@ static int ro_index_lookup(const struct lsmt_ro_index *index,
 	return cnt;
 }
 
-static size_t ro_index_size(const struct lsmt_ro_index *index)
-{
-	return index->pend - index->pbegin;
-}
-
 static struct lsmt_ro_index *
 create_memory_index(const struct segment_mapping *pmappings, size_t n,
 		    uint64_t moffset_begin, uint64_t moffset_end)
 {
 	struct lsmt_ro_index *ret = NULL;
-	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index), GFP_KERNEL);
+	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index),
+					      GFP_KERNEL);
 	if (!ret) {
 		PRINT_ERROR("malloc memory failed");
 		return NULL;
 	}
-	ret->pbegin = pmappings;
-	ret->pend = pmappings + n;
-	ret->mapping = (struct segment_mapping*)pmappings;
+	ret->n = n;
+	ret->mapping = (struct segment_mapping *)pmappings;
 	PRINT_INFO("create memory index done. {index_count: %lu}", n);
 	return ret;
 };
@@ -161,16 +153,16 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 	size_t i = 0;
 	loff_t offset = bio->bi_iter.bi_sector;
 	if (bio_op(bio) != REQ_OP_READ) {
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 
 	if ((offset << SECTOR_SHIFT) > fp->ht.virtual_size) {
 		PRINT_INFO("LSMT: %lld over tail %lld\n", offset,
 			   fp->ht.virtual_size);
-		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-		       bio_op(bio), bio->bi_status);
+		PRINT_ERROR("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__,
+			    __LINE__, bio_op(bio), bio->bi_status);
 		return DM_MAPIO_KILL;
 	}
 
@@ -206,7 +198,8 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 			if (m[i].zeroed) {
 				if (m[i].length < s.length) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO, &fp->split_set);
+							   GFP_NOIO,
+							   &fp->split_set);
 					bio_chain(subbio, bio);
 					zero_fill_bio(subbio);
 					bio_endio(subbio);
@@ -219,7 +212,8 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 				bio_set_dev(bio, dev[m[i].tag]->bdev);
 				if (m[i].length < s.length) {
 					subbio = bio_split(bio, m[i].length,
-							   GFP_NOIO, &fp->split_set);
+							   GFP_NOIO,
+							   &fp->split_set);
 					subbio->bi_iter.bi_sector =
 						m[i].moffset;
 					bio_chain(subbio, bio);
@@ -278,6 +272,18 @@ static void lsmt_close(IFile *ctx)
 	kfree(lsmt_file);
 }
 
+static void *lsmt_alloc_copy(void *ptr, size_t bs, size_t *from_size,
+			     size_t to_size)
+{
+	void *ret = vmalloc(to_size * bs);
+	if (IS_ERR_OR_NULL(ret))
+		return ret;
+	memcpy(ret, ptr, *from_size * bs);
+	*from_size = to_size;
+	vfree(ptr);
+	return ret;
+}
+
 static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 			 struct segment_mapping **mappings, size_t *size,
 			 size_t *capacity, uint64_t start, uint64_t end)
@@ -288,7 +294,8 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 	struct segment_mapping *p =
 		(struct segment_mapping *)ro_index_lower_bound(indexes[level],
 							       start);
-	const struct segment_mapping *pend = indexes[level]->pend;
+	const struct segment_mapping *pend =
+		&indexes[level]->mapping[indexes[level]->n];
 	if (p == pend) {
 		PRINT_DEBUG("index=%p p=%p pend=%p", indexes[level], p, pend);
 		merge_indexes(level + 1, indexes, n, mappings, size, capacity,
@@ -310,28 +317,21 @@ static int merge_indexes(int level, struct lsmt_ro_index **indexes, size_t n,
 			backward_end_to(&it, end);
 		}
 		if (*size == *capacity) {
-			size_t tmp = (*capacity) << 1;
-			PRINT_INFO("realloc array. ( %lu -> %lu )", *capacity,
-				   tmp);
-			struct segment_mapping *m =
-				(struct segment_mapping *)vmalloc(
-					tmp * sizeof(struct segment_mapping));
-			if (m == NULL) {
+			*mappings =
+				lsmt_alloc_copy(*mappings,
+						sizeof(struct segment_mapping),
+						capacity, (*capacity) << 1);
+			if (*size == *capacity) {
 				PRINT_ERROR("realloc failed.");
 				return -1;
 			}
-			memcpy(m, *mappings,
-			       *capacity * sizeof(struct segment_mapping));
-			vfree(*mappings);
-			*mappings = m;
-			*capacity = tmp;
 		}
 		it.tag = level;
 		(*mappings)[*size] = it;
 		(*size)++;
 		start = segment_end(p);
-		PRINT_DEBUG("push segment %ld {offset: %lu, len: %u}",
-			*size, it.offset + 0UL, it.length);
+		PRINT_DEBUG("push segment %ld {offset: %lu, len: %u}", *size,
+			    it.offset + 0UL, it.length);
 		p++;
 		it = *p;
 	}
@@ -346,7 +346,7 @@ static struct lsmt_ro_index *
 merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 {
 	size_t size = 0;
-	size_t capacity = ro_index_size(indexes[0]);
+	size_t capacity = indexes[0]->n;
 	PRINT_DEBUG("init capacity: %lu\n", capacity);
 	struct lsmt_ro_index *ret = NULL;
 	struct segment_mapping *mappings = (struct segment_mapping *)vmalloc(
@@ -362,16 +362,11 @@ merge_memory_indexes(struct lsmt_ro_index **indexes, size_t n)
 	PRINT_INFO("merge done, index size: %lu", size);
 	ret = (struct lsmt_ro_index *)kmalloc(sizeof(struct lsmt_ro_index),
 					      GFP_KERNEL);
-	struct segment_mapping *tmp = (struct segment_mapping *)vmalloc(
-		size * sizeof(struct segment_mapping));
-	memcpy(tmp, mappings, size * sizeof(struct segment_mapping));
-	if (!tmp || !ret)
-		goto err_ret;
-	ret->pbegin = tmp;
-	ret->pend = tmp + size;
-	ret->mapping = tmp;
+	mappings = lsmt_alloc_copy(mappings, sizeof(struct segment_mapping),
+				   &size, size);
+	ret->n = size;
+	ret->mapping = mappings;
 	PRINT_INFO("ret index done. size: %lu", size);
-	vfree(mappings);
 	return ret;
 
 err_ret:
@@ -379,8 +374,6 @@ err_ret:
 		vfree(mappings);
 	if (ret)
 		kfree(ret);
-	if (tmp)
-		vfree(tmp);
 	return NULL;
 }
 
@@ -458,9 +451,10 @@ static struct lsmt_ro_index *load_merge_index(IFile *files[], size_t n,
 			PRINT_ERROR("failed to load index from %d-th file", i);
 			goto error_ret;
 		}
-		struct lsmt_ro_index *pi = create_memory_index(
-			p, ht->index_size, HT_SPACE / ALIGNMENT,
-			ht->index_offset / ALIGNMENT);
+		struct lsmt_ro_index *pi =
+			create_memory_index(p, ht->index_size,
+					    HT_SPACE / ALIGNMENT,
+					    ht->index_offset / ALIGNMENT);
 		if (!pi) {
 			PRINT_ERROR(
 				"failed to create memory index! ( %d-th file )",
