@@ -202,6 +202,8 @@ static int lsmt_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dev,
 					return DM_MAPIO_SUBMITTED;
 				}
 			}
+			s.offset = bio->bi_iter.bi_sector;
+			s.length = bio_sectors(bio);
 			// zeroe block
 			if (m[i].zeroed) {
 				if (m[i].length < s.length) {
