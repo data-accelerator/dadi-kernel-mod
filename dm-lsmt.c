@@ -99,7 +99,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	mdt->nr = i;
 
-	mdt->lsmt = lsmt_open_files(mdt->bf, 1);
+	mdt->lsmt = lsmt_open_files(mdt->bf, mdt->nr);
 
 	if (!mdt->lsmt) {
 		pr_crit("Failed to open lsmt file");

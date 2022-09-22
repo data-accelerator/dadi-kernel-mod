@@ -265,7 +265,7 @@ static void decompress_slowpath(struct work_struct *work)
 			bio_clear_flag(bio, BIO_NO_PAGE_REF);
 			bio->bi_iter.bi_sector = i >> SECTOR_SHIFT;
 			bio->bi_end_io = zfile_read_endio;
-			PRINT_DEBUG("Submit BIO [ra] %ld", i);
+			// PRINT_DEBUG("Submit BIO [ra] %ld", i);
 			submit_bio(bio);
 		} else {
 			if (page) {
@@ -306,7 +306,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 {
 	struct zfile *zf = (struct zfile *)ctx;
 	loff_t offset = bio->bi_iter.bi_sector;
-	size_t count = bio_sectors(bio);
+	size_t count = bio_end_sector(bio) - offset;
 
 	struct decompress_work *cmd;
 	struct decompress_work_fast *fcmd;
@@ -357,9 +357,12 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 
 	LIST_HEAD(list);
 
-	PRINT_DEBUG("Try grab %lu %lld", left, page_nr);
+	// PRINT_DEBUG("Try grab %lu %lld", left, page_nr);
 
 	bool slowpath = false;
+
+	struct blk_plug plug;
+	blk_start_plug(&plug);
 
 	for (i = left; i < right; i += PAGE_SIZE) {
 		page = zfile_grab_cache_page_nowait(zf->mapping,
@@ -374,7 +377,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 				bio_set_flag(bio, BIO_NO_PAGE_REF);
 				cbio->bi_iter.bi_sector = i >> SECTOR_SHIFT;
 				cbio->bi_end_io = zfile_read_endio;
-				PRINT_DEBUG("Submit BIO [fast] %lu", i);
+				// PRINT_DEBUG("Submit BIO [fast] %lu", i);
 				submit_bio(cbio);
 			}
 			slowpath = true;
@@ -387,11 +390,12 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 			list_add_tail(&cpl->list, &list);
 		}
 	}
+	blk_finish_plug(&plug);
 
 	if (slowpath)
 		goto slow_path;
 
-	PRINT_DEBUG("Fast path %lu %lld", left, page_nr);
+	// PRINT_DEBUG("Fast path %lu %lld", left, page_nr);
 
 	fcmd = mempool_alloc(&zf->fcmdpool, GFP_NOIO);
 	if (IS_ERR_OR_NULL(fcmd))
@@ -410,7 +414,7 @@ static int zfile_bioremap(IFile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	return DM_MAPIO_SUBMITTED;
 
 slow_path:
-	PRINT_DEBUG("Slow path %lu %lld", left, page_nr);
+	// PRINT_DEBUG("Slow path %lu %lld", left, page_nr);
 	cmd = mempool_alloc(&zf->cmdpool, GFP_NOIO);
 
 	INIT_WORK(&cmd->work, decompress_slowpath);
@@ -439,11 +443,13 @@ IFile *zfile_open_by_file(struct vfile *file, struct block_device *bdev)
 	zfile = kzalloc(sizeof(struct zfile), GFP_KERNEL);
 
 	if (!is_zfile(file, &zfile->header)) {
+		PRINT_ERROR("ZFile header check failed");
 		kfree(zfile);
 		return NULL;
 	}
 
 	if (!zfile) {
+		PRINT_ERROR("ZFile alloc failed");
 		goto error_out;
 	}
 	zfile->fp = file;

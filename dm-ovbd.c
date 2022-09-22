@@ -5,7 +5,7 @@ static ovbd_context global_ovbd_context;
 int init_ovbd_target(void)
 {
 	global_ovbd_context.wq =
-		alloc_workqueue("ovbd", WQ_HIGHPRI | WQ_CPU_INTENSIVE,
+		alloc_workqueue("ovbd", WQ_HIGHPRI | WQ_CPU_INTENSIVE | WQ_UNBOUND,
 				num_online_cpus() + num_online_cpus() / 4);
 	if (IS_ERR(global_ovbd_context.wq))
 		return -1;

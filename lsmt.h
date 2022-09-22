@@ -37,7 +37,8 @@ struct segment_mapping { /* 8 + 8 bytes */
 };
 
 struct lsmt_ro_index {
-	size_t n;
+	const struct segment_mapping *pbegin;
+	const struct segment_mapping *pend;
 	struct segment_mapping *mapping;
 };
 
