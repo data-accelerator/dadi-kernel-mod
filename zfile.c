@@ -101,6 +101,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 		for (i = left; i < right; i += PAGE_SIZE) {
 			void *d = dm_bufio_get(zf->c, i >> PAGE_SHIFT, &buf);
 			if (IS_ERR_OR_NULL(d)) {
+				kfree(tmp);
 				return ZFILE_DECOMP_NOT_READY;
 			}
 			BUG_ON(IS_ERR(buf));
