@@ -123,7 +123,8 @@ enum decompress_result {
 	ZFILE_DECOMP_NOT_READY = 1,
 };
 
-static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
+static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
+			 bool force)
 {
 	void *dst = NULL;
 	void *src = NULL;
@@ -140,7 +141,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	left = begin & PAGE_MASK;
 	right = ((begin + c_cnt) + (PAGE_SIZE - 1)) & PAGE_MASK;
 
-	if (likely(right - left == PAGE_SIZE)) {
+	if (likely(right - left == PAGE_SIZE && !force)) {
 		src = dm_bufio_get(zf->c, left >> PAGE_SHIFT, &buf);
 		if (IS_ERR_OR_NULL(src)) {
 			return ZFILE_DECOMP_NOT_READY;
@@ -151,7 +152,7 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	} else {
 		tmp = kmalloc(right - left, GFP_KERNEL);
 		for (i = left; i < right; i += PAGE_SIZE) {
-			void *d = dm_bufio_get(zf->c, i >> PAGE_SHIFT, &buf);
+			void *d = dm_bufio_read(zf->c, i >> PAGE_SHIFT, &buf);
 			if (IS_ERR_OR_NULL(d)) {
 				kfree(tmp);
 				return ZFILE_DECOMP_NOT_READY;
@@ -185,13 +186,15 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset)
 	return ZFILE_DECOMP_OK;
 }
 
-static int do_decompress(struct zfile *zf, struct bio *bio, size_t left, int nr)
+static int do_decompress(struct zfile *zf, struct bio *bio, size_t left, int nr,
+			 bool force)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
 	bio_for_each_segment (bv, bio, iter) {
-		int ret = zf_decompress(zf, bv.bv_page,
-					(iter.bi_sector << SECTOR_SHIFT));
+		int ret =
+			zf_decompress(zf, bv.bv_page,
+				      (iter.bi_sector << SECTOR_SHIFT), force);
 		if (unlikely(ret != ZFILE_DECOMP_OK)) {
 			if (ret == ZFILE_DECOMP_ERROR)
 				bio_io_error(bio);
@@ -206,6 +209,7 @@ struct decompress_work {
 	struct work_struct work;
 	struct zfile *zf;
 	struct bio *bio;
+	bool force;
 };
 
 inline static void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
@@ -251,7 +255,7 @@ static void decompress_fn(struct work_struct *work)
 
 	zfile_prefetch(cmd->zf, left, nr);
 
-	if (unlikely(do_decompress(cmd->zf, cmd->bio, left, nr) ==
+	if (unlikely(do_decompress(cmd->zf, cmd->bio, left, nr, cmd->force) ==
 		     ZFILE_DECOMP_NOT_READY)) {
 		goto resubmit;
 	}
@@ -264,7 +268,7 @@ static void decompress_fn(struct work_struct *work)
 	return;
 
 resubmit:
-	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, nr);
+	cmd->force = true;
 	BUG_ON(!queue_work(cmd->zf->ovbd->wq, work));
 }
 
@@ -307,6 +311,7 @@ static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	INIT_WORK(&cmd->work, decompress_fn);
 	cmd->bio = bio;
 	cmd->zf = zf;
+	cmd->force = false;
 
 	BUG_ON(!queue_work(cmd->zf->ovbd->wq, &cmd->work));
 	flush_workqueue(cmd->zf->ovbd->wq);
