@@ -152,7 +152,10 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 	} else {
 		tmp = kmalloc(right - left, GFP_KERNEL);
 		for (i = left; i < right; i += PAGE_SIZE) {
-			void *d = dm_bufio_read(zf->c, i >> PAGE_SHIFT, &buf);
+			void *d = force ? dm_bufio_read(zf->c, i >> PAGE_SHIFT,
+							&buf) :
+					  dm_bufio_get(zf->c, i >> PAGE_SHIFT,
+						       &buf);
 			if (IS_ERR_OR_NULL(d)) {
 				kfree(tmp);
 				return ZFILE_DECOMP_NOT_READY;
