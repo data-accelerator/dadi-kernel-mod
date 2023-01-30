@@ -56,9 +56,9 @@ struct zfile {
 	struct block_device *blkdev;
 	struct zfile_ht header;
 	struct jump_table *jump;
-	struct bio_set bioset;
 	mempool_t cmdpool;
 	struct dm_bufio_client *c;
+	ovbd_context *ovbd;
 };
 
 #define FLAG_SHIFT_HEADER 0
@@ -68,6 +68,11 @@ struct zfile {
 #define FLAG_SHIFT_SEALED 2
 // 1:YES,       0:NO  				# skip it now.
 #define FLAG_SHIFT_HEADER_OVERWRITE 3
+
+#define PREFETCH_PAGE_NR 32
+#define BUFIO_RESERVED_PAGE_NR 128
+#define CMDPOOL_SIZE 4096
+#define MAX_JUMPTABLE_SIZE (1024UL * 1024 * 1024)
 
 static size_t zfile_len(vfile *fp);
 static void zfile_close(vfile *ctx);
@@ -206,7 +211,7 @@ struct decompress_work {
 inline static void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
 {
 #ifdef ZFILE_READAHEAD
-	size_t prefetch_page = 32;
+	size_t prefetch_page = PREFETCH_PAGE_NR;
 #else
 	size_t prefetch_page = 0;
 #endif
@@ -228,7 +233,6 @@ static void decompress_fn(struct work_struct *work)
 	size_t bs;
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
-	struct decompress_work *res;
 	BUG_ON(!work);
 	BUG_ON(!cmd);
 	offset = cmd->bio->bi_iter.bi_sector;
@@ -261,13 +265,7 @@ static void decompress_fn(struct work_struct *work)
 
 resubmit:
 	dm_bufio_prefetch(cmd->zf->c, left >> PAGE_SHIFT, nr);
-	res = mempool_alloc(&cmd->zf->cmdpool, GFP_NOIO);
-	INIT_WORK(&res->work, decompress_fn);
-	res->zf = cmd->zf;
-	res->bio = cmd->bio;
-	BUG_ON(!queue_work(get_ovbd_context()->wq, &res->work));
-
-	mempool_free(cmd, &cmd->zf->cmdpool);
+	BUG_ON(!queue_work(cmd->zf->ovbd->wq, work));
 }
 
 static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
@@ -310,8 +308,8 @@ static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	cmd->bio = bio;
 	cmd->zf = zf;
 
-	BUG_ON(!queue_work(get_ovbd_context()->wq, &cmd->work));
-
+	BUG_ON(!queue_work(cmd->zf->ovbd->wq, &cmd->work));
+	flush_workqueue(cmd->zf->ovbd->wq);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -362,7 +360,7 @@ vfile *zfile_open(struct vfile *file)
 	pr_info("get index_size %lu, index_offset %llu", jt_size,
 		zfile->header.index_offset);
 
-	if (jt_size == 0 || jt_size > 1024UL * 1024 * 1024) {
+	if (jt_size == 0 || jt_size > MAX_JUMPTABLE_SIZE) {
 		goto error_out;
 	}
 
@@ -377,18 +375,17 @@ vfile *zfile_open(struct vfile *file)
 
 	zfile->ops = &zfile_ops;
 
-	ret = mempool_init_kmalloc_pool(&zfile->cmdpool, 4096,
+	ret = mempool_init_kmalloc_pool(&zfile->cmdpool, CMDPOOL_SIZE,
 					sizeof(struct decompress_work));
 	if (ret)
 		goto error_out;
 
-	ret = bioset_init(&zfile->bioset, 4096, 0, BIOSET_NEED_BVECS);
-	if (ret)
-		goto error_out;
-
-	zfile->c = dm_bufio_client_create(bdev, 4096, 128, 0, NULL, NULL);
+	zfile->c = dm_bufio_client_create(
+		bdev, PAGE_SIZE, BUFIO_RESERVED_PAGE_NR, 0, NULL, NULL);
 	if (IS_ERR_OR_NULL(zfile->c))
 		goto error_out;
+
+	zfile->ovbd = get_ovbd_context();
 
 	return (vfile *)zfile;
 
@@ -424,7 +421,6 @@ static void zfile_close(vfile *f)
 			zfile->jump = NULL;
 		}
 		zfile->fp = NULL;
-		bioset_exit(&zfile->bioset);
 		mempool_exit(&zfile->cmdpool);
 		if (!IS_ERR_OR_NULL((zfile->c)))
 			dm_bufio_client_destroy(zfile->c);

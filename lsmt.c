@@ -22,6 +22,7 @@
 #define TYPE_LSMT_RO_INDEX 3
 
 #define OVBD_MAX_LAYERS 256
+#define MAX_INDEX_SIZE (1024UL * 1024 * 1024)
 
 static const uint64_t INVALID_OFFSET = (1UL << 50) - 1;
 static const uint32_t HT_SPACE = 4096;
@@ -494,7 +495,7 @@ static struct lsmt_ro_index *load_merge_index(vfile *files[], size_t n,
 		lsmt_load_ht(files[i], ht);
 		size_t index_bytes =
 			ht->index_size * sizeof(struct segment_mapping);
-		if (index_bytes == 0 || index_bytes > 1024UL * 1024 * 1024)
+		if (index_bytes == 0 || index_bytes > MAX_INDEX_SIZE)
 			goto error_ret;
 		struct segment_mapping *p = vmalloc(index_bytes);
 		if (do_load_index(files[i], p, ht) == -1) {
