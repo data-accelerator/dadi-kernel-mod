@@ -1,6 +1,17 @@
-#include "blkfile.h"
-#include "log-format.h"
+#include "dm-ovbd.h"
 #include <linux/dm-bufio.h>
+
+struct blkdev_as_vfile {
+	vfile_operations *ops;
+	struct block_device *blkdev;
+	loff_t len;
+	struct dm_bufio_client *c;
+};
+
+static struct block_device *blkdev_getblkdev(struct vfile *f)
+{
+	return ((struct blkdev_as_vfile *)f)->blkdev;
+}
 
 // special helper
 // access blockdev data by sync
@@ -50,7 +61,7 @@ out:
 static size_t blkdev_len(struct vfile *ctx)
 {
 	struct blkdev_as_vfile *bf = (struct blkdev_as_vfile *)ctx;
-	PRINT_INFO("blkdev_len %lld\n", bf->len);
+	pr_info("blkdev_len %lld\n", bf->len);
 	return bf->len;
 }
 
@@ -88,15 +99,15 @@ static void blkdev_close(struct vfile *ctx)
 	return;
 }
 
-static struct vfile_op blkdev_op = {
+static vfile_operations blkdev_op = {
+	.blkdev = blkdev_getblkdev,
 	.len = blkdev_len,
 	.pread = blkdev_pread,
-	.pread_async = NULL,
 	.bio_remap = NULL,
 	.close = blkdev_close,
 };
 
-IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
+vfile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
 {
 	if (IS_ERR(blk)) {
 		return NULL;
@@ -105,7 +116,8 @@ IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
 		kzalloc(sizeof(struct blkdev_as_vfile), GFP_KERNEL);
 	if (!ret)
 		return NULL;
-	ret->vfile.op = &blkdev_op;
+	ret->ops = &blkdev_op;
+	ret->blkdev = blk;
 	ret->c = dm_bufio_client_create(blk, 4096, 2, 0, NULL, NULL);
 	if (IS_ERR(ret->c)) {
 		goto errout;
@@ -114,8 +126,8 @@ IFile *open_blkdev_as_vfile(struct block_device *blk, loff_t len)
 	if (len == -1)
 		len = get_capacity(blk->bd_disk) << SECTOR_SHIFT;
 	ret->len = len;
-	// PRINT_INFO("open as vfile dev %p\n", ret->dev);
-	return (IFile *)ret;
+	// pr_info("open as vfile dev %p\n", ret->dev);
+	return (vfile *)ret;
 errout:
 	kfree(ret);
 	return NULL;

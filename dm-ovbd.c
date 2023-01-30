@@ -1,3 +1,5 @@
+#include <linux/version.h>
+#include <linux/module.h>
 #include "dm-ovbd.h"
 
 static ovbd_context global_ovbd_context;
@@ -13,7 +15,7 @@ int init_ovbd_target(void)
 		goto error_out;
 	if (init_zfile_target() < 0)
 		goto error_out;
-	PRINT_INFO("OVBD initialized");
+	pr_info("OVBD initialized");
 	return 0;
 error_out:
 	destroy_workqueue(global_ovbd_context.wq);
@@ -27,7 +29,7 @@ void cleanup_ovbd_target(void)
 	flush_workqueue(global_ovbd_context.wq);
 	destroy_workqueue(global_ovbd_context.wq);
 	global_ovbd_context.wq = NULL;
-	PRINT_INFO("OVBD cleared");
+	pr_info("OVBD cleared");
 }
 
 ovbd_context* get_ovbd_context() {
