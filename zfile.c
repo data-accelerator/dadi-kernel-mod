@@ -307,6 +307,7 @@ static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	}
 
 	cmd = mempool_alloc(&zf->cmdpool, GFP_NOIO);
+	BUG_ON(IS_ERR_OR_NULL(cmd));
 
 	INIT_WORK(&cmd->work, decompress_fn);
 	cmd->bio = bio;
@@ -314,7 +315,6 @@ static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	cmd->force = false;
 
 	BUG_ON(!queue_work(cmd->zf->ovbd->wq, &cmd->work));
-	flush_workqueue(cmd->zf->ovbd->wq);
 	return DM_MAPIO_SUBMITTED;
 }
 
