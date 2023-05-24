@@ -1,17 +1,17 @@
-#include <linux/version.h>
+// SPDX-License-Identifier: GPL-2.0
+
 #include <linux/module.h>
 #include "dm-ovbd.h"
 
-static ovbd_context global_ovbd_context;
+static struct ovbd_context global_ovbd_context;
 
-int init_ovbd_target(void)
+static int __init init_ovbd_target(void)
 {
 	global_ovbd_context.wq =
-		alloc_workqueue("ovbd", WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE,
-				num_online_cpus() * 2);
+		alloc_workqueue("ovbd", WQ_MEM_RECLAIM | WQ_FREEZABLE | WQ_UNBOUND, 0);
 	if (IS_ERR(global_ovbd_context.wq))
 		return -1;
-	if (init_lsmt_target() < 0) 
+	if (init_lsmt_target() < 0)
 		goto error_out;
 	if (init_zfile_target() < 0)
 		goto error_out;
@@ -22,7 +22,7 @@ error_out:
 	return -1;
 }
 
-void cleanup_ovbd_target(void)
+static void __exit cleanup_ovbd_target(void)
 {
 	cleanup_zfile_target();
 	cleanup_lsmt_target();
@@ -32,12 +32,14 @@ void cleanup_ovbd_target(void)
 	pr_info("OVBD cleared");
 }
 
-ovbd_context* get_ovbd_context() {
+struct ovbd_context *get_ovbd_context(void)
+{
 	return &global_ovbd_context;
 }
 
 module_init(init_ovbd_target);
 module_exit(cleanup_ovbd_target);
+
+MODULE_AUTHOR("Rui Du <durui@linux.alibaba.com>");
+MODULE_DESCRIPTION("DADI OverlayBD implementation as device mapper target");
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Du Rui <ray.dr@alibaba-inc.com>");
-MODULE_DESCRIPTION("DADI OverlayBD implemention as device mapper target");

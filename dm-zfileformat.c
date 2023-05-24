@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 #include "dm-ovbd.h"
 #include <linux/lz4.h>
 #include <linux/vmalloc.h>
@@ -5,60 +7,64 @@
 #include <linux/kthread.h>
 #include <linux/uuid.h>
 #include <linux/dm-bufio.h>
+#include <linux/build_bug.h>
 
-static const uint32_t ZF_SPACE = 512;
-static uint64_t *MAGIC0 = (uint64_t *)"ZFile\0\1";
+static const u32 ZF_SPACE = 512;
+static u64 *MAGIC0 = (u64 *)"ZFile\0\1";
 static const uuid_t MAGIC1 = UUID_INIT(0x74756a69, 0x2e79, 0x7966, 0x40, 0x41,
 				       0x6c, 0x69, 0x62, 0x61, 0x62, 0x61);
 
 struct compress_options {
-	uint32_t block_size; // 4
-	uint8_t type; // 5
-	uint8_t level; // 6
-	uint8_t use_dict; // 7
-	uint32_t args; // 11
-	uint32_t dict_size; // 15
-	uint8_t verify; // 16
-};
+	u32 block_size; // 4
+	u8 type; // 5
+	u8 level; // 6
+	u8 use_dict; // 7
+	u8 __padding0; // 8
+	u32 args; // 12
+	u32 dict_size; // 16
+	u8 verify; // 17
+	u8 __padding1[7]; //24
+} __packed;
 
-_Static_assert(20 == sizeof(struct compress_options), "CO size not fit");
+static_assert(sizeof(struct compress_options) == 24, "CO size not fit");
 
 struct zfile_ht {
-	uint64_t magic0; // 8
-	uuid_t magic1; // 4+2+2+2+6 = 4 + 12 = 20
+	u64 magic0; // 8
+	uuid_t magic1; // 24
 
-	// till here offset = 28
-	uint32_t size_ht; //= sizeof(HeaderTrailer); // 32
-	uint64_t flags; //= 0;                        // 40
+	// till here offset = 24
+	u32 size_ht; //= sizeof(HeaderTrailer); // 28
+	u8 __padding[4]; // 32
+	u64 flags; //= 0;                        // 40
 
-	// till here offset = 40
-	uint64_t index_offset; // in bytes  48
-	uint64_t index_size; // num of index  56
+	// till here offset = 36
+	u64 index_offset; // in bytes  48
+	u64 index_size; // num of index  56
 
-	uint64_t vsize; // 64
-	uint64_t reserved_0; // 72
+	u64 vsize; // 64
+	u64 reserved_0; // 72
 
-	struct compress_options opt; // suppose to be 24
-};
+	struct compress_options opt; // suppose to be 96
+} __packed;
 
-_Static_assert(96 == sizeof(struct zfile_ht), "Header size not fit");
+static_assert(sizeof(struct zfile_ht) == 96, "Header size not fit");
 
 struct jump_table {
-	uint64_t partial_offset : 48; // 48 bits logical offset + 16 bits partial minimum
+	u64 partial_offset : 48; // 48 bits logical offset + 16 bits partial minimum
 	uint16_t delta : 16;
-} __attribute__((packed));
+} __packed;
 
 // zfile can be treated as file with extends
 struct zfile {
-	vfile_operations *ops;
-	vfile *fp;
-	bool onwership;
+	struct vfile_operations *ops;
+	struct vfile *fp;
+	bool ownership;
 	struct block_device *blkdev;
 	struct zfile_ht header;
 	struct jump_table *jump;
 	mempool_t cmdpool;
 	struct dm_bufio_client *c;
-	ovbd_context *ovbd;
+	struct ovbd_context *ovbd;
 };
 
 #define FLAG_SHIFT_HEADER 0
@@ -66,37 +72,30 @@ struct zfile {
 #define FLAG_SHIFT_TYPE 1
 // 1:data file, 0:index file
 #define FLAG_SHIFT_SEALED 2
-// 1:YES,       0:NO  				# skip it now.
+// 1:YES	0:NO				# skip it now.
 #define FLAG_SHIFT_HEADER_OVERWRITE 3
 
 #define PREFETCH_PAGE_NR 32
-#define BUFIO_RESERVED_PAGE_NR 128
 #define CMDPOOL_SIZE 4096
 #define MAX_JUMPTABLE_SIZE (1024UL * 1024 * 1024)
 
-static size_t zfile_len(vfile *fp);
-static void zfile_close(vfile *ctx);
-static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dev,
-			  unsigned nr);
+static size_t zfile_len(struct vfile *fp);
+static void zfile_close(struct vfile *ctx);
+static int zfile_bioremap(struct vfile *ctx, struct bio *bio, struct dm_dev **dev,
+			  unsigned int nr);
 
-static vfile_operations zfile_ops = { .len = zfile_len,
-				      .bio_remap = zfile_bioremap,
-				      .close = zfile_close };
+static struct vfile_operations zfile_ops = { .len = zfile_len,
+					     .bio_remap = zfile_bioremap,
+					     .close = zfile_close };
 
-#ifdef ZFILE_HEAD_OVERWRITE
-static uint32_t get_flag_bit(struct zfile_ht *ht, uint32_t shift)
+static u32 get_flag_bit(struct zfile_ht *ht, u32 shift)
 {
 	return ht->flags & (1 << shift);
 }
-#endif
 
 static bool is_header_overwrite(struct zfile_ht *ht)
 {
-#ifdef ZFILE_HEAD_OVERWRITE
 	return get_flag_bit(ht, FLAG_SHIFT_HEADER_OVERWRITE);
-#else
-	return false;
-#endif
 }
 
 static size_t zfile_len(struct vfile *zfile)
@@ -104,9 +103,10 @@ static size_t zfile_len(struct vfile *zfile)
 	return ((struct zfile *)zfile)->header.vsize;
 }
 
-static void build_jump_table(uint32_t *jt_saved, struct zfile *zf)
+static void build_jump_table(u32 *jt_saved, struct zfile *zf)
 {
 	size_t i;
+
 	zf->jump = vmalloc((zf->header.index_size + 2) *
 			   sizeof(struct jump_table));
 	zf->jump[0].partial_offset = ZF_SPACE;
@@ -131,23 +131,25 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 	size_t idx, c_cnt;
 	loff_t begin, left, right, i;
 	int ret = 0;
-	struct dm_buffer *buf;
+	int decomp_cnt = 0;
+	struct dm_buffer *buf = NULL;
 	void *tmp = NULL;
 
 	idx = offset >> PAGE_SHIFT;
 	begin = zf->jump[idx].partial_offset;
-	c_cnt = zf->jump[idx].delta -
-		(zf->header.opt.verify ? sizeof(uint32_t) : 0);
+	c_cnt = zf->jump[idx].delta - (zf->header.opt.verify ? sizeof(u32) : 0);
 	left = begin & PAGE_MASK;
 	right = ((begin + c_cnt) + (PAGE_SIZE - 1)) & PAGE_MASK;
 
-	if (likely(right - left == PAGE_SIZE && !force)) {
-		src = dm_bufio_get(zf->c, left >> PAGE_SHIFT, &buf);
-		if (IS_ERR_OR_NULL(src)) {
-			return ZFILE_DECOMP_NOT_READY;
+	if (likely(right - left == PAGE_SIZE)) {
+		if (force)
+			src = dm_bufio_read(zf->c, left >> PAGE_SHIFT, &buf);
+		else
+			src = dm_bufio_get(zf->c, left >> PAGE_SHIFT, &buf);
+		if (IS_ERR_OR_NULL(src) || IS_ERR_OR_NULL(buf)) {
+			ret = ZFILE_DECOMP_NOT_READY;
+			goto out;
 		}
-		BUG_ON(IS_ERR(buf));
-		BUG_ON(IS_ERR(src));
 		src = src + (begin - left);
 	} else {
 		tmp = kmalloc(right - left, GFP_KERNEL);
@@ -156,37 +158,37 @@ static int zf_decompress(struct zfile *zf, struct page *page, loff_t offset,
 							&buf) :
 					  dm_bufio_get(zf->c, i >> PAGE_SHIFT,
 						       &buf);
-			if (IS_ERR_OR_NULL(d)) {
-				kfree(tmp);
-				return ZFILE_DECOMP_NOT_READY;
+			if (IS_ERR_OR_NULL(d) || IS_ERR_OR_NULL(buf)) {
+				ret = ZFILE_DECOMP_NOT_READY;
+				goto out;
 			}
-			BUG_ON(IS_ERR(buf));
-			BUG_ON(IS_ERR(d));
 			memcpy(tmp + i - left, d, PAGE_SIZE);
 			dm_bufio_release(buf);
+			buf = NULL;
 		}
 		src = tmp + (begin - left);
 	}
 
-	dst = kmap_atomic(page);
+	dst = kmap_local_page(page);
 
 	prefetchw(dst);
 
-	ret = LZ4_decompress_fast(src, dst, PAGE_SIZE);
+	decomp_cnt = LZ4_decompress_fast(src, dst, PAGE_SIZE);
 
-	kunmap_atomic(dst);
+	kunmap_local(dst);
 
-	if (ret < 0) {
+	if (decomp_cnt < 0) {
 		pr_err("Decompress error\n");
+		ret = ZFILE_DECOMP_ERROR;
+		goto out;
 	}
 
-	if (tmp) {
-		kfree(tmp);
-	} else {
+out:
+	if (!IS_ERR_OR_NULL(buf))
 		dm_bufio_release(buf);
-	}
+	kfree(tmp);
 
-	return ZFILE_DECOMP_OK;
+	return ret;
 }
 
 static int do_decompress(struct zfile *zf, struct bio *bio, size_t left, int nr,
@@ -194,7 +196,8 @@ static int do_decompress(struct zfile *zf, struct bio *bio, size_t left, int nr,
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
-	bio_for_each_segment (bv, bio, iter) {
+
+	bio_for_each_segment(bv, bio, iter) {
 		int ret =
 			zf_decompress(zf, bv.bv_page,
 				      (iter.bi_sector << SECTOR_SHIFT), force);
@@ -215,7 +218,7 @@ struct decompress_work {
 	bool force;
 };
 
-inline static void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
+static inline void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
 {
 #ifdef ZFILE_READAHEAD
 	size_t prefetch_page = PREFETCH_PAGE_NR;
@@ -225,7 +228,7 @@ inline static void zfile_prefetch(struct zfile *zf, size_t left, size_t nr)
 	dm_bufio_prefetch(zf->c, left >> PAGE_SHIFT, nr + prefetch_page);
 }
 
-inline static void zfile_cleanup_compressed_cache(struct zfile *zf, size_t left,
+static inline void zfile_cleanup_compressed_cache(struct zfile *zf, size_t left,
 						  size_t nr)
 {
 #ifdef ZFILE_CLEANUP_CACHE
@@ -240,8 +243,9 @@ static void decompress_fn(struct work_struct *work)
 	size_t bs;
 	struct decompress_work *cmd =
 		container_of(work, struct decompress_work, work);
-	BUG_ON(!work);
-	BUG_ON(!cmd);
+
+	if (!work)
+		return;
 	offset = cmd->bio->bi_iter.bi_sector;
 	count = bio_sectors(cmd->bio);
 	bs = cmd->zf->header.opt.block_size;
@@ -272,19 +276,18 @@ static void decompress_fn(struct work_struct *work)
 
 resubmit:
 	cmd->force = true;
-	BUG_ON(!queue_work(cmd->zf->ovbd->wq, work));
+	queue_work(cmd->zf->ovbd->wq, work);
 }
 
-static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
-			  unsigned int nr)
+static int zfile_bioremap(struct vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
+			  unsigned int dev_nr)
 {
 	struct zfile *zf = (struct zfile *)ctx;
 	loff_t offset = bio->bi_iter.bi_sector;
 	size_t count = bio_sectors(bio);
-
 	struct decompress_work *cmd;
 
-	if (unlikely(nr != 1 || !dm_dev[0])) {
+	if (unlikely(dev_nr != 1 || !dm_dev[0])) {
 		pr_err("ZFile: nr wrong\n");
 		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
 		       bio_op(bio), bio->bi_status);
@@ -310,38 +313,39 @@ static int zfile_bioremap(vfile *ctx, struct bio *bio, struct dm_dev **dm_dev,
 	}
 
 	cmd = mempool_alloc(&zf->cmdpool, GFP_NOIO);
-	BUG_ON(IS_ERR_OR_NULL(cmd));
+	if (IS_ERR_OR_NULL(cmd))
+		return DM_MAPIO_DELAY_REQUEUE;
 
 	INIT_WORK(&cmd->work, decompress_fn);
 	cmd->bio = bio;
 	cmd->zf = zf;
 	cmd->force = false;
 
-	BUG_ON(!queue_work(cmd->zf->ovbd->wq, &cmd->work));
+	queue_work_on(raw_smp_processor_id(), cmd->zf->ovbd->wq, &cmd->work);
 	return DM_MAPIO_SUBMITTED;
 }
 
-static bool load_zfile_header(vfile *file, struct zfile_ht *ht);
+static bool load_zfile_header(struct vfile *file, struct zfile_ht *ht);
 
-vfile *zfile_open(struct vfile *file)
+struct vfile *zfile_open(struct vfile *file)
 {
-	uint32_t *jt_saved;
+	u32 *jt_saved;
 	size_t jt_size = 0;
 	struct zfile *zfile = NULL;
 	int ret = 0;
 	size_t file_size = 0;
 	loff_t tailer_offset;
 	struct block_device *bdev = file->ops->blkdev(file);
-	zfile = kzalloc(sizeof(struct zfile), GFP_KERNEL);
+
+	zfile = kzalloc(sizeof(*zfile), GFP_KERNEL);
 
 	if (!load_zfile_header(file, &zfile->header)) {
 		kfree(zfile);
 		return NULL;
 	}
 
-	if (!zfile) {
+	if (!zfile)
 		goto error_out;
-	}
 	zfile->fp = file;
 
 	// should verify header
@@ -353,24 +357,25 @@ vfile *zfile_open(struct vfile *file)
 		ret = zfile->fp->ops->pread(zfile->fp, &zfile->header,
 					    sizeof(struct zfile_ht),
 					    tailer_offset);
-		pr_info("zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld "
-			"verify=%d",
+		if (ret < (ssize_t)sizeof(struct zfile_ht)) {
+			pr_err("zfile: failed to fetch zfile tailer");
+			goto error_out;
+		}
+		pr_info("zfile: Trailer vsize=%lld index_offset=%lld index_size=%lld verify=%d",
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
 	} else {
-		pr_info("zfile header overwrite: size=%lld index_offset=%lld "
-			"index_size=%lld verify=%d",
+		pr_info("zfile header overwrite: size=%lld index_offset=%lld index_size=%lld verify=%d",
 			zfile->header.vsize, zfile->header.index_offset,
 			zfile->header.index_size, zfile->header.opt.verify);
 	}
 
-	jt_size = ((uint64_t)zfile->header.index_size) * sizeof(uint32_t);
+	jt_size = ((u64)zfile->header.index_size) * sizeof(u32);
 	pr_info("get index_size %lu, index_offset %llu", jt_size,
 		zfile->header.index_offset);
 
-	if (jt_size == 0 || jt_size > MAX_JUMPTABLE_SIZE) {
+	if (jt_size == 0 || jt_size > MAX_JUMPTABLE_SIZE)
 		goto error_out;
-	}
 
 	jt_saved = vmalloc(jt_size);
 
@@ -388,25 +393,24 @@ vfile *zfile_open(struct vfile *file)
 	if (ret)
 		goto error_out;
 
-	zfile->c = dm_bufio_client_create(
-		bdev, PAGE_SIZE, BUFIO_RESERVED_PAGE_NR, 0, NULL, NULL);
+	zfile->c = dm_bufio_client_create(bdev, PAGE_SIZE, 1, 0, NULL, NULL);
 	if (IS_ERR_OR_NULL(zfile->c))
 		goto error_out;
 
 	zfile->ovbd = get_ovbd_context();
 
-	return (vfile *)zfile;
+	return (struct vfile *)zfile;
 
 error_out:
-	if (zfile) {
+	if (zfile)
 		zfile_close((struct vfile *)zfile);
-	}
 	return NULL;
 }
 
 static bool load_zfile_header(struct vfile *file, struct zfile_ht *ht)
 {
 	ssize_t ret;
+
 	if (!file)
 		return false;
 
@@ -415,10 +419,10 @@ static bool load_zfile_header(struct vfile *file, struct zfile_ht *ht)
 		pr_info("zfile: failed to load header %ld", ret);
 		return false;
 	}
-	return ht->magic0 == *MAGIC0 && uuid_equal(&(ht->magic1), &MAGIC1);
+	return ht->magic0 == *MAGIC0 && uuid_equal(&ht->magic1, &MAGIC1);
 }
 
-static void zfile_close(vfile *f)
+static void zfile_close(struct vfile *f)
 {
 	struct zfile *zfile = (struct zfile *)f;
 
@@ -430,7 +434,7 @@ static void zfile_close(vfile *f)
 		}
 		zfile->fp = NULL;
 		mempool_exit(&zfile->cmdpool);
-		if (!IS_ERR_OR_NULL((zfile->c)))
+		if (!IS_ERR_OR_NULL(zfile->c))
 			dm_bufio_client_destroy(zfile->c);
 		kfree(zfile);
 	}

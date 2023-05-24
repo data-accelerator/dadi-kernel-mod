@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0
+
 #include "dm-ovbd.h"
 
 struct zfile_dm_target {
 	struct dm_dev *dev;
-	vfile *zfile;
-	vfile *bf;
+	struct vfile *zfile;
+	struct vfile *bf;
 };
 
 static int zfile_target_map(struct dm_target *ti, struct bio *bio)
@@ -13,11 +15,12 @@ static int zfile_target_map(struct dm_target *ti, struct bio *bio)
 	switch (bio_op(bio)) {
 	case REQ_OP_READ:
 		return mdt->zfile->ops->bio_remap((struct vfile *)mdt->zfile,
-						 bio, &mdt->dev, 1);
+						  bio, &mdt->dev, 1);
+	default:
+		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		       bio_op(bio), bio->bi_status);
+		return DM_MAPIO_KILL;
 	}
-	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-	       bio_op(bio), bio->bi_status);
-	return DM_MAPIO_KILL;
 }
 
 static int zfile_target_end_io(struct dm_target *ti, struct bio *bio,
@@ -40,7 +43,7 @@ static int zfile_target_ctr(struct dm_target *ti, unsigned int argc,
 	size_t zflen;
 	int ret;
 
-	pr_info("\n >>in function zfile_target_ctr \n");
+	pr_debug("\n >>in function %s\n", __func__);
 
 	if (argc < 2) {
 		pr_info("\n Invalid no.of arguments.\n");
@@ -48,10 +51,9 @@ static int zfile_target_ctr(struct dm_target *ti, unsigned int argc,
 		return -EINVAL;
 	}
 
-	mdt = kzalloc(sizeof(struct zfile_dm_target), GFP_KERNEL);
+	mdt = kzalloc(sizeof(*mdt), GFP_KERNEL);
 
-	if (mdt == NULL) {
-		pr_info("\n Mdt is null\n");
+	if (!mdt) {
 		ti->error = "dm-zfile_target: Cannot allocate context";
 		return -ENOMEM;
 	}
@@ -95,7 +97,7 @@ static int zfile_target_ctr(struct dm_target *ti, unsigned int argc,
 
 	ti->private = mdt;
 
-	pr_info("\n>>out function zfile_target_ctr \n");
+	pr_debug("\n>>out function %s\n", __func__);
 	return 0;
 
 error_out:
@@ -107,21 +109,22 @@ error_out:
 		dm_put_device(ti, mdt->dev);
 bad:
 	kfree(mdt);
-	pr_info("\n>>out function zfile_target_ctr with error \n");
+	pr_debug("\n>>out function %s with error\n", __func__);
 	return -EINVAL;
 }
 
 static void zfile_target_dtr(struct dm_target *ti)
 {
 	struct zfile_dm_target *mdt = (struct zfile_dm_target *)ti->private;
-	pr_info("\n<<in function zfile_target_dtr \n");
+
+	pr_debug("\n<<in function %s\n", __func__);
 	if (mdt->zfile)
 		mdt->zfile->ops->close((struct vfile *)mdt->zfile);
 	if (mdt->bf)
 		mdt->bf->ops->close((struct vfile *)mdt->bf);
 	dm_put_device(ti, mdt->dev);
 	kfree(mdt);
-	pr_info("\n>>out function zfile_target_dtr \n");
+	pr_debug("\n>>out function %s\n", __func__);
 }
 
 static struct target_type zfile_target = {
@@ -138,9 +141,10 @@ static struct target_type zfile_target = {
 int init_zfile_target(void)
 {
 	int result;
+
 	result = dm_register_target(&zfile_target);
 	if (result < 0)
-		pr_info("\n Error in registering target \n");
+		pr_info("\n Error in registering target\n");
 	return 0;
 }
 

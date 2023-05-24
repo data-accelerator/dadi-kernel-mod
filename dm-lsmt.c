@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0
+
 #include "dm-ovbd.h"
 
 struct lsmt_dm_target {
 	struct dm_dev *dev[256];
-	vfile *lsmt;
-	vfile *bf[256];
+	struct vfile *lsmt;
+	struct vfile *bf[256];
 	unsigned int nr;
 };
 
@@ -20,10 +22,11 @@ static int lsmt_target_map(struct dm_target *ti, struct bio *bio)
 	case REQ_OP_READ:
 		return mdt->lsmt->ops->bio_remap((struct vfile *)mdt->lsmt, bio,
 						 mdt->dev, mdt->nr);
+	default:
+		pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
+		       bio_op(bio), bio->bi_status);
+		return DM_MAPIO_KILL;
 	}
-	pr_err("DM_MAPIO_KILL %s:%d op=%d sts=%d\n", __FILE__, __LINE__,
-	       bio_op(bio), bio->bi_status);
-	return DM_MAPIO_KILL;
 }
 
 static int lsmt_target_end_io(struct dm_target *ti, struct bio *bio,
@@ -47,18 +50,17 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int ret;
 	int i;
 
-	pr_info("\n >>in function lsmt_target_ctr \n");
+	pr_debug("\n >>in function %s\n", __func__);
 
 	if (argc < 2) {
-		pr_info("\n Invalid no.of arguments.\n");
+		pr_warn("\n Invalid no.of arguments.\n");
 		ti->error = "Invalid argument count";
 		return -EINVAL;
 	}
 
-	mdt = kmalloc(sizeof(struct lsmt_dm_target), GFP_KERNEL);
+	mdt = kmalloc(sizeof(*mdt), GFP_KERNEL);
 
-	if (mdt == NULL) {
-		pr_info("\n Mdt is null\n");
+	if (!mdt) {
 		ti->error = "dm-lsmt_target: Cannot allocate context";
 		return -ENOMEM;
 	}
@@ -100,7 +102,7 @@ static int lsmt_target_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = mdt;
 
-	pr_info("\n>>out function lsmt_target_ctr \n");
+	pr_debug("\n>>out function %s\n", __func__);
 	return 0;
 
 error_out:
@@ -115,7 +117,7 @@ error_out:
 	}
 bad:
 	kfree(mdt);
-	pr_info("\n>>out function lsmt_target_ctr with error \n");
+	pr_debug("\n>>out function %s with error\n", __func__);
 	return -EINVAL;
 }
 
@@ -123,14 +125,14 @@ static void lsmt_target_dtr(struct dm_target *ti)
 {
 	struct lsmt_dm_target *mdt = (struct lsmt_dm_target *)ti->private;
 	unsigned int i = 0;
-	pr_info("\n<<in function lsmt_target_dtr \n");
+
+	pr_debug("\n<<in function %s\n", __func__);
 	if (mdt->lsmt)
 		mdt->lsmt->ops->close((struct vfile *)mdt->lsmt);
-	for (i = 0; i < mdt->nr; i++) {
+	for (i = 0; i < mdt->nr; i++)
 		dm_put_device(ti, mdt->dev[i]);
-	}
 	kfree(mdt);
-	pr_info("\n>>out function lsmt_target_dtr \n");
+	pr_debug("\n>>out function %s\n", __func__);
 }
 
 static struct target_type lsmt_target = {
@@ -147,9 +149,10 @@ static struct target_type lsmt_target = {
 int init_lsmt_target(void)
 {
 	int result;
+
 	result = dm_register_target(&lsmt_target);
 	if (result < 0)
-		pr_info("\n Error in registering target \n");
+		pr_warn("\n Error in registering target\n");
 	return 0;
 }
 

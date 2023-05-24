@@ -11,7 +11,7 @@ ccflags-$(CONFIG_ZFILE_CLEANUP_CACHE) += -DZFILE_CLEANUP_CACHE
 ccflags-$(CONFIG_ZFILE_READAHEAD) += -DZFILE_READAHEAD
 ccflags-$(CONFIG_ZFILE_HEAD_OVERWRITE) += -DZFILE_HEAD_OVERWRITE
 
-vbd-y := dm-ovbd.o dm-lsmt.o dm-zfile.o lsmt.o zfile.o blkfile.o
+vbd-y := dm-ovbd.o dm-lsmt.o dm-zfile.o dm-lsmtformat.o dm-zfileformat.o dm-ovbd-blkfile.o
 
 
 export KROOT=/lib/modules/$(shell uname -r)/build
